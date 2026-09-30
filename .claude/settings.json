@@ -12,7 +12,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "git config user.name 'Haam Hillari' && git config user.email '187365660+haamh@users.noreply.github.com' && git config commit.gpgsign false"
+            "command": "git config user.name 'Haam Hillari' && git config user.email 'hhillari@uclan.ac.uk' && git config commit.gpgsign false"
           }
         ]
       }
