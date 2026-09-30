@@ -49,137 +49,193 @@ function toTexture(c: HTMLCanvasElement, repeat = 1, srgb = true) {
   return t;
 }
 
-export function asphaltTexture(seed = 3) {
-  const S = 1024;
+const sstep = (a: number, b: number, x: number) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+
+function rgbaCanvas(S: number, fill: (i: number, o: Uint8ClampedArray) => void) {
   const { c, ctx } = makeCanvas(S, S);
   const img = ctx.createImageData(S, S);
-  const n = tileNoise(S, 4, 6, seed);
-  const n2 = tileNoise(S, 64, 3, seed + 9);
+  for (let i = 0; i < S * S; i++) { fill(i, img.data as unknown as Uint8ClampedArray); }
+  ctx.putImageData(img, 0, 0);
+  return { c, ctx };
+}
+
+/** Neutral dark-grey runway / taxiway asphalt: fine aggregate, worn patches, sealed cracks, optional transverse joints + grooves. */
+export function asphaltTexture(seed = 3, joints = false) {
+  const S = 1024;
+  const n = tileNoise(S, 4, 6, seed), n2 = tileNoise(S, 256, 2, seed + 9), n3 = tileNoise(S, 2, 4, seed + 31), n4 = tileNoise(S, 64, 3, seed + 5);
   const rnd = mulberry(seed * 7);
-  for (let i = 0; i < S * S; i++) {
-    const speck = rnd() < 0.08 ? (rnd() - 0.3) * 60 : 0;
-    const v = 58 + n[i] * 34 + n2[i] * 22 + speck;
-    img.data[i * 4] = v; img.data[i * 4 + 1] = v; img.data[i * 4 + 2] = v * 1.03; img.data[i * 4 + 3] = 255;
+  const { c, ctx } = rgbaCanvas(S, (i, d) => {
+    let v = 60 + (n[i] - 0.5) * 18 + (n2[i] - 0.5) * 30 + (n4[i] - 0.5) * 10;
+    const r = rnd();
+    if (r < 0.05) v += 18 + rnd() * 30; else if (r > 0.97) v -= 12;
+    v += sstep(0.52, 0.75, n3[i]) * 9 - sstep(0.55, 0.8, 1 - n3[i]) * 4;
+    d[i * 4] = v * 1.01; d[i * 4 + 1] = v * 0.995; d[i * 4 + 2] = v * 0.975; d[i * 4 + 3] = 255;
+  });
+  ctx.lineCap = "round";
+  // sealed cracks
+  for (let k = 0; k < 14; k++) {
+    let x = rnd() * S, y = rnd() * S, a = rnd() * 6.28;
+    ctx.strokeStyle = `rgba(14,14,15,${0.25 + rnd() * 0.25})`; ctx.lineWidth = 1 + rnd() * 1.5;
+    ctx.beginPath(); ctx.moveTo(x, y);
+    for (let s = 0; s < 12; s++) { a += (rnd() - 0.5) * 0.9; x += Math.cos(a) * 14; y += Math.sin(a) * 14; ctx.lineTo(x, y); }
+    ctx.stroke();
   }
-  ctx.putImageData(img, 0, 0);
-  // rubber / tar patches
-  ctx.globalAlpha = 0.08;
-  for (let i = 0; i < 40; i++) {
-    ctx.fillStyle = rnd() > 0.5 ? "#111" : "#777";
-    const x = rnd() * S, y = rnd() * S, w = 20 + rnd() * 160;
-    ctx.fillRect(x, y, w, 4 + rnd() * 10);
+  if (joints) {
+    ctx.fillStyle = "rgba(0,0,0,0.05)";
+    for (let x = 12; x < S; x += 52) ctx.fillRect(x, 0, 1.5, S);       // transverse grooves
+    ctx.fillStyle = "rgba(10,10,10,0.42)";
+    ctx.fillRect(0, 0, 3, S); ctx.fillRect(S - 2, 0, 2, S);            // transverse construction joint
+    ctx.fillRect(0, 0, S, 2); ctx.fillRect(0, S / 2, S, 2);            // paving lane joints
+    ctx.fillStyle = "rgba(255,255,255,0.03)"; ctx.fillRect(4, 0, 2, S);
   }
-  ctx.globalAlpha = 1;
   return toTexture(c);
 }
 
+/** Warm light-grey concrete slabs (7.5 m) with per-slab tone, joints, stains. */
 export function concreteTexture(seed = 11) {
-  const S = 1024;
-  const { c, ctx } = makeCanvas(S, S);
-  const img = ctx.createImageData(S, S);
-  const n = tileNoise(S, 4, 6, seed);
-  const n2 = tileNoise(S, 128, 2, seed + 2);
-  for (let i = 0; i < S * S; i++) {
-    const v = 150 + n[i] * 45 + n2[i] * 25;
-    img.data[i * 4] = v; img.data[i * 4 + 1] = v * 0.99; img.data[i * 4 + 2] = v * 0.95; img.data[i * 4 + 3] = 255;
-  }
-  ctx.putImageData(img, 0, 0);
-  ctx.strokeStyle = "rgba(40,40,40,0.55)";
-  ctx.lineWidth = 3;
-  for (let i = 0; i <= 4; i++) {
-    ctx.beginPath(); ctx.moveTo(i * S / 4, 0); ctx.lineTo(i * S / 4, S); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0, i * S / 4); ctx.lineTo(S, i * S / 4); ctx.stroke();
-  }
+  const S = 1024, cell = S / 4;
+  const n = tileNoise(S, 4, 6, seed), n2 = tileNoise(S, 256, 2, seed + 2), n3 = tileNoise(S, 8, 4, seed + 8);
+  const rnd = mulberry(seed * 3);
+  const tone: number[] = []; for (let i = 0; i < 16; i++) tone.push((rnd() - 0.5) * 16);
+  const { c, ctx } = rgbaCanvas(S, (i, d) => {
+    const x = i % S, y = (i / S) | 0, t = tone[Math.floor(y / cell) * 4 + Math.floor(x / cell)];
+    const v = 148 + t + (n[i] - 0.5) * 26 + (n2[i] - 0.5) * 18 - sstep(0.6, 0.85, n3[i]) * 14;
+    d[i * 4] = v; d[i * 4 + 1] = v * 0.985; d[i * 4 + 2] = v * 0.94; d[i * 4 + 3] = 255;
+  });
+  ctx.globalAlpha = 0.12;
+  for (let k = 0; k < 30; k++) { ctx.fillStyle = "#222"; const x = rnd() * S, y = rnd() * S; ctx.beginPath(); ctx.ellipse(x, y, 10 + rnd() * 40, 5 + rnd() * 14, rnd() * 3, 0, 6.28); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "rgba(45,42,38,0.6)";
+  for (let i = 0; i < 4; i++) { ctx.fillRect(i * cell - 1.5, 0, 3, S); ctx.fillRect(0, i * cell - 1.5, S, 3); }
+  ctx.fillStyle = "rgba(255,250,240,0.08)";
+  for (let i = 0; i < 4; i++) { ctx.fillRect(i * cell + 2, 0, 2, S); ctx.fillRect(0, i * cell + 2, S, 2); }
   return toTexture(c);
 }
 
+/** Neutral luminance detail for terrain (multiplied onto the macro colour). */
 export function grassDetailTexture() {
   const S = 512;
-  const { c, ctx } = makeCanvas(S, S);
-  const img = ctx.createImageData(S, S);
-  const n = tileNoise(S, 8, 6, 21);
-  const n2 = tileNoise(S, 128, 2, 5);
-  for (let i = 0; i < S * S; i++) {
-    const v = 0.72 + n[i] * 0.35 + (n2[i] - 0.5) * 0.35;
-    img.data[i * 4] = 170 * v; img.data[i * 4 + 1] = 180 * v; img.data[i * 4 + 2] = 160 * v; img.data[i * 4 + 3] = 255;
-  }
-  ctx.putImageData(img, 0, 0);
+  const n = tileNoise(S, 8, 6, 21), n2 = tileNoise(S, 128, 2, 5);
+  const { c } = rgbaCanvas(S, (i, d) => {
+    const v = 0.62 + (n[i] - 0.5) * 0.5 + (n2[i] - 0.5) * 0.4;
+    d[i * 4] = 165 * v; d[i * 4 + 1] = 166 * v; d[i * 4 + 2] = 152 * v; d[i * 4 + 3] = 255;
+  });
   return toTexture(c);
 }
 
-/** Macro patchwork farmland texture (tileable) */
+/** Mown airfield grass: olive / yellow-green, mowing strips along X, dry patches, blade noise. 60 m tile. */
+export function airfieldGrassTexture() {
+  const S = 1024;
+  const n = tileNoise(S, 4, 5, 61), n2 = tileNoise(S, 32, 4, 62), n3 = tileNoise(S, 256, 2, 63), n4 = tileNoise(S, 2, 3, 64);
+  const { c } = rgbaCanvas(S, (i, d) => {
+    const y = ((i / S) | 0) / S;
+    const strip = Math.floor(y * 6) % 2 ? 1 : 0;
+    const wob = Math.sin(y * 6 * Math.PI * 2);
+    const dry = sstep(0.5, 0.72, n[i] * 0.7 + n4[i] * 0.3);
+    let r = 82, g = 96, b = 46;
+    r += dry * 52; g += dry * 30; b += dry * 22;
+    const dark = sstep(0.55, 0.8, 1 - n2[i]) * 0.22;
+    let k = 1 + (n2[i] - 0.5) * 0.35 + (n3[i] - 0.5) * 0.4 + strip * 0.08 + wob * 0.025 - dark;
+    d[i * 4] = r * k; d[i * 4 + 1] = g * k; d[i * 4 + 2] = b * k; d[i * 4 + 3] = 255;
+  });
+  return toTexture(c);
+}
+
+/** Rock / scree / strata detail (neutral, tileable). */
+export function rockTexture() {
+  const S = 512;
+  const n = tileNoise(S, 4, 6, 301), n2 = tileNoise(S, 64, 4, 302), w = tileNoise(S, 2, 3, 303);
+  const rnd = mulberry(9);
+  const { c } = rgbaCanvas(S, (i, d) => {
+    const y = ((i / S) | 0) / S;
+    const s = Math.sin((y * 14 + w[i] * 3.2 + n[i] * 1.5) * Math.PI * 2);
+    let v = 0.62 + s * 0.09 + (n[i] - 0.5) * 0.45 + (n2[i] - 0.5) * 0.45;
+    if (rnd() < 0.06) v *= 0.75 + rnd() * 0.6;
+    d[i * 4] = 150 * v; d[i * 4 + 1] = 142 * v; d[i * 4 + 2] = 130 * v; d[i * 4 + 3] = 255;
+  });
+  return toTexture(c);
+}
+
+/** Macro patchwork farmland texture (tileable): muted field palette, hedgerows, clumpy forests, lanes, villages. */
 export function farmlandTexture() {
   const S = 2048;
   const { c, ctx } = makeCanvas(S, S);
   const rnd = mulberry(77);
-  ctx.fillStyle = "#56693a";
+  ctx.fillStyle = "#6d6f40";
   ctx.fillRect(0, 0, S, S);
-  const palette = ["#5f7437", "#6d7c3c", "#8a8a4a", "#a39a62", "#4f6a33", "#79703f", "#627d3d", "#93904f", "#566a2f", "#7d8a48", "#9a8c5a", "#4a5f2e"];
-  const drawWrapped = (fn: (ox: number, oy: number) => void) => {
-    for (const ox of [-S, 0, S]) for (const oy of [-S, 0, S]) fn(ox, oy);
-  };
-  // fields as rotated rectangles in blocks
-  for (let b = 0; b < 90; b++) {
-    const bx = rnd() * S, by = rnd() * S, ang = (rnd() - 0.5) * 0.6;
+  const palette = ["#6c6f3e", "#7b7a45", "#8f8a52", "#a39a64", "#5e6b3a", "#75684a", "#6a5c43", "#81734f", "#9a9163", "#4f5f35", "#857f4c", "#b0a673", "#62613d", "#72794a", "#58633a", "#7f6f52"];
+  const drawWrapped = (fn: (ox: number, oy: number) => void) => { for (const ox of [-S, 0, S]) for (const oy of [-S, 0, S]) fn(ox, oy); };
+  for (let b = 0; b < 100; b++) {
+    const bx = rnd() * S, by = rnd() * S, ang = (rnd() - 0.5) * 0.7 + (rnd() < 0.3 ? 0.8 : 0);
     const cols = 2 + Math.floor(rnd() * 4), rows = 2 + Math.floor(rnd() * 4);
-    const fw = 40 + rnd() * 90, fh = 30 + rnd() * 80;
+    const fw = 36 + rnd() * 100, fh = 30 + rnd() * 90;
     for (let i = 0; i < cols; i++) for (let j = 0; j < rows; j++) {
       const col = palette[Math.floor(rnd() * palette.length)];
-      const stripes = rnd() > 0.5;
+      const kind = rnd(), sAng = rnd() < 0.5;
+      const pw = fw * (0.85 + rnd() * 0.3), ph = fh * (0.85 + rnd() * 0.3);
       drawWrapped((ox, oy) => {
         ctx.save();
         ctx.translate(bx + ox, by + oy); ctx.rotate(ang);
         ctx.fillStyle = col;
-        ctx.fillRect(i * fw, j * fh, fw - 2, fh - 2);
-        if (stripes) {
-          ctx.strokeStyle = "rgba(0,0,0,0.06)"; ctx.lineWidth = 1;
-          for (let k = 0; k < fw; k += 4) { ctx.beginPath(); ctx.moveTo(i * fw + k, j * fh); ctx.lineTo(i * fw + k, j * fh + fh - 2); ctx.stroke(); }
+        ctx.fillRect(i * fw, j * fh, pw - 2, ph - 2);
+        const g = ctx.createLinearGradient(i * fw, j * fh, i * fw + (sAng ? pw : 0), j * fh + (sAng ? 0 : ph));
+        g.addColorStop(0, "rgba(255,240,190,0.07)"); g.addColorStop(1, "rgba(20,20,10,0.10)");
+        ctx.fillStyle = g; ctx.fillRect(i * fw, j * fh, pw - 2, ph - 2);
+        if (kind > 0.35) {
+          ctx.strokeStyle = kind > 0.7 ? "rgba(0,0,0,0.07)" : "rgba(255,245,200,0.06)"; ctx.lineWidth = 1;
+          for (let k = 0; k < (sAng ? pw : ph); k += 3) {
+            ctx.beginPath();
+            if (sAng) { ctx.moveTo(i * fw + k, j * fh); ctx.lineTo(i * fw + k, j * fh + ph - 2); } else { ctx.moveTo(i * fw, j * fh + k); ctx.lineTo(i * fw + pw - 2, j * fh + k); }
+            ctx.stroke();
+          }
         }
+        // hedgerow on two sides
+        ctx.strokeStyle = "rgba(38,52,30,0.85)"; ctx.lineWidth = 1.6;
+        ctx.beginPath(); ctx.moveTo(i * fw - 1, j * fh - 1); ctx.lineTo(i * fw + pw - 1, j * fh - 1); ctx.lineTo(i * fw + pw - 1, j * fh + ph - 1); ctx.stroke();
         ctx.restore();
       });
     }
   }
-  // forests (dark blobs)
-  for (let k = 0; k < 160; k++) {
-    const x = rnd() * S, y = rnd() * S, r = 10 + rnd() * 50;
+  // forests: clumpy dark blue-green stands
+  for (let k = 0; k < 70; k++) {
+    const x = rnd() * S, y = rnd() * S, R = 14 + rnd() * 60, cnt = Math.floor(R * 1.4);
     drawWrapped((ox, oy) => {
-      const g = ctx.createRadialGradient(x + ox, y + oy, 0, x + ox, y + oy, r);
-      g.addColorStop(0, "rgba(28,48,22,0.95)"); g.addColorStop(0.7, "rgba(34,56,26,0.8)"); g.addColorStop(1, "rgba(34,56,26,0)");
-      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x + ox, y + oy, r, 0, Math.PI * 2); ctx.fill();
+      for (let t = 0; t < cnt; t++) {
+        const a = rnd() * 6.28, rr = Math.sqrt(rnd()) * R, r = 3 + rnd() * 6;
+        ctx.fillStyle = `rgba(${26 + rnd() * 12},${44 + rnd() * 14},${36 + rnd() * 12},0.95)`;
+        ctx.beginPath(); ctx.arc(x + ox + Math.cos(a) * rr, y + oy + Math.sin(a) * rr * 0.8, r, 0, 6.28); ctx.fill();
+      }
     });
   }
-  // roads
-  ctx.strokeStyle = "rgba(120,115,105,0.8)"; ctx.lineWidth = 1.6;
+  // lanes
+  ctx.strokeStyle = "rgba(128,120,104,0.75)"; ctx.lineWidth = 1.4;
   for (let k = 0; k < 26; k++) {
-    let x = rnd() * S, y = rnd() * S, a = rnd() * Math.PI * 2;
+    const x = rnd() * S, y = rnd() * S, a = rnd() * Math.PI * 2;
     drawWrapped((ox, oy) => {
       let xx = x, yy = y, aa = a;
       ctx.beginPath(); ctx.moveTo(xx + ox, yy + oy);
       for (let s = 0; s < 40; s++) { aa += (rnd() - 0.5) * 0.3; xx += Math.cos(aa) * 25; yy += Math.sin(aa) * 25; ctx.lineTo(xx + ox, yy + oy); }
       ctx.stroke();
     });
-    x += 0; y += 0; a += 0;
   }
   // villages
   for (let k = 0; k < 30; k++) {
     const x = rnd() * S, y = rnd() * S;
     for (let h = 0; h < 25; h++) {
       const hx = x + (rnd() - 0.5) * 40, hy = y + (rnd() - 0.5) * 40;
-      ctx.fillStyle = rnd() > 0.5 ? "#8a6f5e" : "#a9a39a";
+      ctx.fillStyle = rnd() > 0.5 ? "#8b6e5a" : "#a8a197";
       ctx.fillRect(hx, hy, 2 + rnd() * 2, 2 + rnd() * 2);
     }
   }
-  // subtle noise overlay
   const img = ctx.getImageData(0, 0, S, S);
-  const n = tileNoise(S, 16, 4, 99);
+  const n = tileNoise(S, 16, 4, 99), n2 = tileNoise(S, 256, 2, 98);
   for (let i = 0; i < S * S; i++) {
-    const f = 0.85 + n[i] * 0.3;
+    const f = 0.88 + n[i] * 0.22 + (n2[i] - 0.5) * 0.1;
     img.data[i * 4] *= f; img.data[i * 4 + 1] *= f; img.data[i * 4 + 2] *= f;
   }
   ctx.putImageData(img, 0, 0);
   return toTexture(c);
 }
-
 export function waterNormalTexture() {
   const S = 512;
   const { c, ctx } = makeCanvas(S, S);
@@ -215,28 +271,58 @@ export function textTexture(text: string, w = 256, h = 512, font = "bold 400px '
   return t;
 }
 
+/** Cumulus billboard: RGB = view-facing normal of a cauliflower of spherical lobes (flat base), A = coverage. Lit in the cloud shader. */
 export function softPuffTexture(seed = 5) {
-  const S = 256;
-  const { c, ctx } = makeCanvas(S, S);
-  const img = ctx.createImageData(S, S);
-  const n = tileNoise(S, 4, 5, seed);
-  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
-    const dx = (x - S / 2) / (S / 2), dy = (y - S / 2) / (S / 2);
-    const d = Math.sqrt(dx * dx + dy * dy);
-    const i = y * S + x;
-    let a = Math.max(0, 1 - d);
-    a = Math.pow(a, 1.2) * (0.55 + n[i] * 0.9);
-    a = Math.min(1, a * 1.5);
-    const shade = 235 + (1 - dy) * 10;
-    img.data[i * 4] = shade; img.data[i * 4 + 1] = shade; img.data[i * 4 + 2] = shade + 5;
-    img.data[i * 4 + 3] = a * 255;
+  const S = 512;
+  const rnd = mulberry(seed);
+  const data = new Uint8Array(S * S * 4);
+  const zb = new Float32Array(S * S).fill(-1);
+  const covA = new Float32Array(S * S);
+  const base = 0.8;
+  const lobes: number[][] = [];
+  const add = (cx: number, cy: number, r: number) => lobes.push([cx, cy, r]);
+  for (let k = 0; k < 9; k++) add(0.5 + (rnd() - 0.5) * 0.5, base - 0.17 - rnd() * 0.3, 0.17 + rnd() * 0.07);
+  for (let k = 0; k < 14; k++) { const cx = 0.5 + (rnd() - 0.5) * 0.66; const H = 0.5 * Math.sqrt(Math.max(0, 1 - ((cx - 0.5) / 0.4) ** 2)); const r = 0.1 + rnd() * 0.08; add(cx, base - r * 0.9 - rnd() * H * 0.25, r); }
+  for (let k = 0; k < 34; k++) {
+    const cx = 0.5 + (rnd() - 0.5) * 0.72; const H = 0.66 * Math.pow(Math.max(0, 1 - ((cx - 0.5) / 0.4) ** 2), 0.6);
+    const r = 0.035 + rnd() * 0.075 * (0.4 + H);
+    add(cx, base - r * 0.7 - rnd() * H, r);
   }
-  ctx.putImageData(img, 0, 0);
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
+  for (const [cx, cy, r] of lobes) {
+    const x0 = Math.max(0, Math.floor((cx - r * 1.3) * S)), x1 = Math.min(S - 1, Math.ceil((cx + r * 1.3) * S));
+    const y0 = Math.max(0, Math.floor((cy - r * 1.3) * S)), y1 = Math.min(S - 1, Math.ceil((cy + r * 1.3) * S));
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      if (y / S > base) continue;
+      const dx = (x / S - cx) / r, dy = (y / S - cy) / r;
+      const rough = 1 + 0.12 * Math.sin(Math.atan2(dy, dx) * 7 + cx * 40) * Math.sin(cy * 50);
+      const d2 = (dx * dx + dy * dy) / (rough * rough);
+      if (d2 >= 1) continue;
+      const z = Math.sqrt(1 - d2) * r + cy * 0.06 * -1;
+      const i = y * S + x;
+      // soft, wispy lobe rims instead of hard-edged discs
+      const cov = 1 - (d2 < 0.45 ? 0 : ((d2 - 0.45) / 0.55) ** 1.6);
+      covA[i] = Math.max(covA[i], cov);
+      if (z <= zb[i]) continue;
+      zb[i] = z;
+      const nz = Math.sqrt(1 - d2);
+      data[i * 4] = (dx / rough * 0.5 + 0.5) * 255; data[i * 4 + 1] = (-dy / rough * 0.5 + 0.5) * 255; data[i * 4 + 2] = (nz * 0.5 + 0.5) * 255; data[i * 4 + 3] = 255;
+    }
+  }
+  // coverage: soft lobe rims, then a few box-blur passes so edges read as vapour, not cut-outs
+  let a1 = covA, a2 = new Float32Array(S * S);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let y = 2; y < S - 2; y++) for (let x = 2; x < S - 2; x++) {
+      const i = y * S + x;
+      a2[i] = (a1[i] * 2 + a1[i - 1] + a1[i + 1] + a1[i - S] + a1[i + S] + a1[i - 2] + a1[i + 2] + a1[i - 2 * S] + a1[i + 2 * S]) / 10;
+    }
+    [a1, a2] = [a2, a1];
+  }
+  for (let i = 0; i < S * S; i++) { const a = Math.round(Math.min(1, a1[i] * 1.08) * 255); data[i * 4 + 3] = a; if (!zb[i] || zb[i] < -0.5) { data[i * 4] = 128; data[i * 4 + 1] = 128; data[i * 4 + 2] = 255; } }
+  const t = new THREE.DataTexture(data, S, S, THREE.RGBAFormat);
+  t.generateMipmaps = true; t.minFilter = THREE.LinearMipmapLinearFilter; t.magFilter = THREE.LinearFilter;
+  t.anisotropy = 4; t.needsUpdate = true;
   return t;
 }
-
 export function glowTexture(inner = "rgba(255,255,255,1)", outer = "rgba(255,255,255,0)") {
   const S = 128;
   const { c, ctx } = makeCanvas(S, S);

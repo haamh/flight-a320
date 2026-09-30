@@ -1,12 +1,12 @@
 import * as THREE from "three";
 import { Sky } from "three/examples/jsm/objects/Sky.js";
-import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
+import { mergeGeometries, mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { AIRPORTS, TERRAIN, buildTerrain, heightAt, WATER_LEVEL, type Airport } from "./terrain";
 import {
-  asphaltTexture, concreteTexture, farmlandTexture, grassDetailTexture, waterNormalTexture, textTexture,
+  asphaltTexture, concreteTexture, farmlandTexture, grassDetailTexture, airfieldGrassTexture, rockTexture, waterNormalTexture, textTexture,
   softPuffTexture, glowTexture, buildingFacadeTexture, windowGlowTexture, makeCanvas, tileNoise,
 } from "./textures";
-import { mulberry, fbm, smoothstep, lerp, clamp } from "./noise";
+import { mulberry, fbm, smoothstep, lerp, clamp, simplex2 } from "./noise";
 import { runwayFrame } from "./physics";
 
 const D2R = Math.PI / 180;
@@ -52,6 +52,39 @@ interface TerrainChunk {
 }
 interface TerrainSuper extends TerrainChunk { far: boolean; kids: TerrainChunk[] }
 
+/** aerial perspective on top of the scene fog: distance desaturates and blues surfaces (applied before the fog mix) */
+/** ground surfaces: tame the blue sky-dome diffuse IBL (dark pavement otherwise turns navy) */
+function groundTone(mat: THREE.Material, k = 0.62, sat = 0.4) {
+  const prev = mat.onBeforeCompile;
+  mat.onBeforeCompile = (sh, r) => {
+    prev?.call(mat, sh, r);
+    sh.fragmentShader = sh.fragmentShader.replace("#include <lights_fragment_maps>", `#include <lights_fragment_maps>
+      #if defined( RE_IndirectDiffuse )
+        iblIrradiance = mix(vec3(dot(iblIrradiance, vec3(0.3, 0.59, 0.11))), iblIrradiance, ${sat.toFixed(2)}) * ${k.toFixed(2)};
+      #endif`);
+  };
+  const key = "gtone" + hazeId++;
+  mat.customProgramCacheKey = () => key;
+}
+
+let hazeId = 0;
+function addHaze(mat: THREE.Material, scale = 24000, extra?: (sh: { fragmentShader: string }) => void) {
+  const prev = mat.onBeforeCompile;
+  mat.onBeforeCompile = (sh, r) => {
+    prev?.call(mat, sh, r);
+    extra?.(sh);
+    sh.fragmentShader = sh.fragmentShader.replace("#include <fog_fragment>", `
+      #ifdef USE_FOG
+        float hzD = 1.0 - exp(-vFogDepth / ${scale.toFixed(1)});
+        float hzL = dot(gl_FragColor.rgb, vec3(0.3, 0.59, 0.11));
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, mix(vec3(hzL), fogColor, 0.3), hzD * 0.6);
+      #endif
+      #include <fog_fragment>`);
+  };
+  const key = "haze" + hazeId++;
+  mat.customProgramCacheKey = () => key;
+}
+
 function buildTerrainMesh() {
   buildTerrain();
   const { N, size, cx, cz, heights } = TERRAIN;
@@ -70,33 +103,46 @@ function buildTerrainMesh() {
     const il = 32767 / Math.sqrt(gx * gx + 1 + gz * gz);
     nrm[k * 4] = gx * il; nrm[k * 4 + 1] = il; nrm[k * 4 + 2] = gz * il;
     const n = fbm(x / 1200, z / 1200, 3);
-    const rock = clamp(smoothstep(0.35, 0.7, slope + n * 0.1) + smoothstep(700, 1200, h + n * 200), 0, 1);
+    const rock = clamp(smoothstep(0.3, 0.62, slope + n * 0.1) + smoothstep(800, 1300, h + n * 260), 0, 1);
     const snow = smoothstep(1350, 1700, h + n * 250) * (1 - smoothstep(0.9, 1.3, slope));
     const sand = smoothstep(4, -1, h) * (1 - rock);
-    col[k * 4] = Math.round(rock * 255); col[k * 4 + 1] = Math.round(snow * 255); col[k * 4 + 2] = Math.round(sand * 255); col[k * 4 + 3] = 255;
+    const nf = fbm(x / 3000 + 9, z / 3000 - 4, 3), nf2 = fbm(x / 500, z / 500, 2);
+    const forest = smoothstep(0.1, 0.3, nf + nf2 * 0.12) * smoothstep(12, 60, h) * (1 - smoothstep(850, 1150, h + nf * 200)) * (1 - smoothstep(0.42, 0.7, slope)) * (1 - sand);
+    col[k * 4] = Math.round(rock * 255); col[k * 4 + 1] = Math.round(snow * 255); col[k * 4 + 2] = Math.round(sand * 255); col[k * 4 + 3] = Math.round(forest * 255);
   }
   const farm = farmlandTexture();
   farm.repeat.set(size / 3800, size / 3800);
   const detail = grassDetailTexture();
+  const rockTex = rockTexture();
   const mat = new THREE.MeshStandardMaterial({ map: farm, vertexColors: true, roughness: 0.95, metalness: 0 });
   mat.onBeforeCompile = (sh) => {
     sh.uniforms.detailMap = { value: detail };
-    sh.fragmentShader = "uniform sampler2D detailMap;\n" + sh.fragmentShader
+    sh.uniforms.rockMap = { value: rockTex };
+    sh.fragmentShader = "uniform sampler2D detailMap; uniform sampler2D rockMap;\n" + sh.fragmentShader
       .replace("#include <map_fragment>", `
         vec4 farmC = texture2D(map, vMapUv);
         vec3 det = texture2D(detailMap, vMapUv * 90.0).rgb * 1.45;
         vec3 det2 = texture2D(detailMap, vMapUv * 7.0).rgb * 1.3;
-        vec3 farm = farmC.rgb * mix(vec3(1.0), det, 0.55) * mix(vec3(1.0), det2, 0.35);
-        vec3 rockC = vec3(0.30, 0.285, 0.26) * det * det2;
-        vec3 snowC = vec3(0.92, 0.94, 0.97) * mix(vec3(1.0), det, 0.15);
-        vec3 sandC = vec3(0.62, 0.56, 0.42) * det;
+        vec3 det3 = texture2D(detailMap, vMapUv * 1.3).rgb * 1.5;
+        vec3 rk1 = texture2D(rockMap, vMapUv * 34.0).rgb * 1.5;
+        vec3 rk2 = texture2D(rockMap, vMapUv * 5.0 + 0.37).rgb * 1.5;
+        vec3 farm = farmC.rgb * mix(vec3(1.0), det, 0.5) * mix(vec3(1.0), det2, 0.35) * mix(vec3(1.0), det3, 0.3);
+        vec3 forestC = vec3(0.12, 0.165, 0.10) * mix(vec3(1.0), det * 1.2, 0.8) * mix(vec3(1.0), det2, 0.6);
+        farm = mix(farm * 1.55, forestC * 1.2, vColor.a);
+        vec3 rockC = mix(vec3(0.38, 0.34, 0.29), vec3(0.52, 0.47, 0.40), rk2.r * 0.8) * mix(rk1, vec3(1.0), 0.15) * mix(vec3(1.0), rk2, 0.7);
+        rockC = mix(rockC, vec3(0.36, 0.33, 0.29) * rk1, smoothstep(0.3, 0.9, rk2.g) * 0.35);
+        float snowW = vColor.g * smoothstep(0.25, 0.75, rk2.r * 0.6 + rk1.r * 0.45);
+        vec3 snowC = vec3(0.88, 0.91, 0.96) * mix(vec3(1.0), rk1, 0.18);
+        vec3 sandC = vec3(0.6, 0.55, 0.42) * det;
         vec3 cc = mix(farm, rockC, vColor.r);
-        cc = mix(cc, snowC, vColor.g);
+        cc = mix(cc, snowC, snowW);
         cc = mix(cc, sandC, vColor.b);
         diffuseColor.rgb *= cc;
       `)
       .replace("#include <color_fragment>", "");
   };
+  groundTone(mat, 0.7, 0.5);
+  addHaze(mat, 26000);
 
   // index buffers are shared by every tile with the same grid size (top grid + 4 skirts, outward facing)
   const idxCache = new Map<number, THREE.BufferAttribute>();
@@ -150,7 +196,7 @@ function buildTerrainMesh() {
       pos[v * 3] = x0 + gi * cell - ox; pos[v * 3 + 1] = heights[k]; pos[v * 3 + 2] = z0 + gj * cell - oz;
       uv[v * 2] = gi / N; uv[v * 2 + 1] = 1 - gj / N;
       nr[v * 4] = nrm[k * 4]; nr[v * 4 + 1] = nrm[k * 4 + 1]; nr[v * 4 + 2] = nrm[k * 4 + 2];
-      cl[v * 4] = col[k * 4]; cl[v * 4 + 1] = col[k * 4 + 1]; cl[v * 4 + 2] = col[k * 4 + 2]; cl[v * 4 + 3] = 255;
+      cl[v * 4] = col[k * 4]; cl[v * 4 + 1] = col[k * 4 + 1]; cl[v * 4 + 2] = col[k * 4 + 2]; cl[v * 4 + 3] = col[k * 4 + 3];
     }
     const skirt = (s: number, d: number) => {
       pos[d * 3] = pos[s * 3]; pos[d * 3 + 1] = pos[s * 3 + 1] - depth; pos[d * 3 + 2] = pos[s * 3 + 2];
@@ -245,16 +291,44 @@ function tireMarksTexture() {
   const { c, ctx } = makeCanvas(W, H);
   const rnd = mulberry(9);
   ctx.clearRect(0, 0, W, H);
-  for (let i = 0; i < 260; i++) {
-    const y = H / 2 + (rnd() - 0.5) * H * 0.5 + (rnd() > 0.5 ? 1 : -1) * H * 0.12;
-    const x = rnd() * W * 0.6;
-    const len = 80 + rnd() * 500;
+  // broad rubber build-up in the wheel tracks, strongest around the touchdown zone
+  for (const ty of [0.3, 0.7, 0.5]) {
+    for (let i = 0; i < 70; i++) {
+      const x = W * (0.12 + rnd() * 0.5), y = H * (ty + (rnd() - 0.5) * 0.14), rx = 30 + rnd() * 110, ry = 4 + rnd() * 12;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, rx);
+      g.addColorStop(0, `rgba(12,12,12,${(ty === 0.5 ? 0.05 : 0.1) + rnd() * 0.08})`); g.addColorStop(1, "rgba(12,12,12,0)");
+      ctx.save(); ctx.translate(x, y); ctx.scale(1, ry / rx); ctx.translate(-x, -y);
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, rx, 0, 6.28); ctx.fill(); ctx.restore();
+    }
+  }
+  for (let i = 0; i < 320; i++) {
+    const y = H * (rnd() > 0.5 ? 0.3 : 0.7) + (rnd() - 0.5) * H * 0.2;
+    const x = rnd() * W * 0.75, len = 30 + rnd() * 260;
     const g = ctx.createLinearGradient(x, 0, x + len, 0);
-    g.addColorStop(0, "rgba(10,10,10,0)"); g.addColorStop(0.15, `rgba(10,10,10,${0.25 + rnd() * 0.3})`); g.addColorStop(1, "rgba(10,10,10,0)");
-    ctx.fillStyle = g; ctx.fillRect(x, y, len, 2 + rnd() * 5);
+    g.addColorStop(0, "rgba(10,10,10,0)"); g.addColorStop(0.2, `rgba(10,10,10,${0.08 + rnd() * 0.16})`); g.addColorStop(1, "rgba(10,10,10,0)");
+    ctx.fillStyle = g; ctx.fillRect(x, y, len, 1.5 + rnd() * 4);
   }
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 8;
+  return t;
+}
+
+/** weathered marking paint: speckled wear (texture repeats per stripe) */
+function paintTexture() {
+  const S = 128;
+  const { c } = makeCanvas(S, S);
+  const ctx = c.getContext("2d")!;
+  const img = ctx.createImageData(S, S);
+  const n = tileNoise(S, 8, 4, 77), rnd = mulberry(5);
+  for (let i = 0; i < S * S; i++) {
+    const v = 0.86 + (n[i] - 0.5) * 0.3 - (rnd() < 0.05 ? 0.25 : 0);
+    const k = Math.min(255, v * 255);
+    img.data[i * 4] = k; img.data[i * 4 + 1] = k; img.data[i * 4 + 2] = k * 0.98; img.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace; t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = 8;
   return t;
 }
 
@@ -296,30 +370,25 @@ function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record
   const L = a.length, Wd = a.width;
   const toWorld = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z).applyMatrix4(grp.matrixWorld);
   grp.updateMatrixWorld(true);
-  const flat = (w: number, d: number, mat: THREE.Material, x: number, y: number, z: number, rot = 0) => {
+  const flat = (w: number, d: number, mat: THREE.Material, x: number, y: number, z: number, rot = 0, tile = 0) => {
     const g = new THREE.PlaneGeometry(w, d);
+    if (tile) { const uv = g.attributes.uv as THREE.BufferAttribute; for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * w / tile, uv.getY(i) * d / tile); }
     g.rotateX(-Math.PI / 2);
     const m = new THREE.Mesh(g, mat);
     m.position.set(x, y, z); m.rotation.y = rot; m.receiveShadow = true;
     grp.add(m);
     return m;
   };
-  const asphalt = mats.asphalt as THREE.MeshStandardMaterial;
-  // grass field
-  const grassM = mats.grass.clone() as THREE.MeshStandardMaterial;
-  grassM.map = (mats.grass as THREE.MeshStandardMaterial).map!.clone();
-  grassM.map.repeat.set((L + 1600) / 25, 1400 / 25);
-  grassM.map.needsUpdate = true;
-  flat(L + 1600, 1400, grassM, 0, 0.02, -250);
-  // runway
-  const rwM = asphalt.clone();
-  rwM.map = asphalt.map!.clone(); rwM.map.repeat.set(L / 30, (Wd + 15) / 30); rwM.map.needsUpdate = true;
-  flat(L + 120, Wd + 15, rwM, 0, 0.06, 0);
+  // grass field (60 m texture tile)
+  flat(L + 1600, 1400, mats.grass, 0, 0.02, -250, 0, 60);
+  // runway (30 m tile, joints every 30 m)
+  flat(L + 120, Wd + 15, mats.asphalt, 0, 0.06, 0, 0, 30);
   // blast pads
   const padM = mats.concrete;
-  flat(60, Wd, padM, -L / 2 - 90, 0.055, 0); flat(60, Wd, padM, L / 2 + 90, 0.055, 0);
+  flat(60, Wd, padM, -L / 2 - 90, 0.055, 0, 0, 30); flat(60, Wd, padM, L / 2 + 90, 0.055, 0, 0, 30);
   // tire marks
-  const tm = new THREE.MeshStandardMaterial({ map: mats.tireMap ? (mats.tireMap as THREE.MeshBasicMaterial).map : null, transparent: true, depthWrite: false, roughness: 0.9 });
+  const tm = new THREE.MeshPhysicalMaterial({ map: mats.tireMap ? (mats.tireMap as THREE.MeshBasicMaterial).map : null, transparent: true, depthWrite: false, roughness: 0.95, specularIntensity: 0.2 });
+  groundTone(tm);
   const tmW = flat(700, 22, tm, -L / 2 + 480, 0.075, 0);
   tmW.renderOrder = 1;
   const tmE = flat(700, 22, tm, L / 2 - 480, 0.075, 0, Math.PI); tmE.renderOrder = 1;
@@ -354,11 +423,10 @@ function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record
   }
   // taxiway system
   const twZ = -190;
-  const twM = asphalt.clone(); twM.map = asphalt.map!.clone(); twM.map.repeat.set(L / 40, 1); twM.map.needsUpdate = true;
-  twM.color = new THREE.Color("#b8b8b8");
-  flat(L, 23, twM, 0, 0.05, twZ);
+  const twM = mats.taxi;
+  flat(L, 23, twM, 0, 0.05, twZ, 0, 30);
   const connectors = [-L / 2 + 30, -L / 4, 0, L / 4, L / 2 - 30];
-  for (const x of connectors) flat(23, Math.abs(twZ) - Wd / 2, twM, x, 0.045, twZ / 2 - Wd / 4);
+  for (const x of connectors) flat(23, Math.abs(twZ) - Wd / 2, twM, x, 0.045, twZ / 2 - Wd / 4, 0, 30);
   const yellow: THREE.BufferGeometry[] = [];
   quad(0, twZ, L, 0.3, yellow);
   for (const x of connectors) {
@@ -369,9 +437,7 @@ function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record
   const apW = big ? 1300 : 700, apD = 220;
   const apX = big ? -150 : 0;
   const apZ = twZ - 12 - apD / 2;
-  const apM = (mats.concrete as THREE.MeshStandardMaterial).clone();
-  apM.map = (mats.concrete as THREE.MeshStandardMaterial).map!.clone(); apM.map.repeat.set(apW / 30, apD / 30); apM.map.needsUpdate = true;
-  flat(apW, apD, apM, apX, 0.04, apZ);
+  flat(apW, apD, mats.concrete, apX, 0.04, apZ, 0, 30);
   const stands = big ? 6 : 3;
   const standXs: number[] = [];
   for (let s = 0; s < stands; s++) {
@@ -568,32 +634,39 @@ function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record
 }
 
 /* ---------------------------------------------------------------------- */
-/** Tree crown: deformed icosahedron (detail 0/1) or octahedron, vertex colour = white. */
-function crownGeometry(kind: "ico1" | "ico0" | "octa") {
-  const crown = kind === "octa" ? new THREE.OctahedronGeometry(1, 0) : new THREE.IcosahedronGeometry(1, kind === "ico1" ? 1 : 0);
+/** Tree crown: welded, noise-displaced lobed sphere (smooth normals), vertex colour darkens the underside. */
+function crownGeometry(kind: "ico2" | "ico1" | "ico0" | "octa") {
+  let crown: THREE.BufferGeometry = kind === "octa" ? new THREE.OctahedronGeometry(1, 0) : new THREE.IcosahedronGeometry(1, kind === "ico2" ? 2 : kind === "ico1" ? 1 : 0);
+  crown.deleteAttribute("normal"); crown.deleteAttribute("uv");
+  crown = mergeVertices(crown, 1e-4);
   const pos = crown.attributes.position as THREE.BufferAttribute;
-  const rnd = mulberry(3);
+  const hi = kind === "ico2", mid = kind === "ico1";
+  const col = new Float32Array(pos.count * 3);
   for (let i = 0; i < pos.count; i++) {
-    const y = pos.getY(i);
-    const s = 0.85 + rnd() * 0.3;
-    pos.setXYZ(i, pos.getX(i) * s * (1 - y * 0.25), y * 1.4 * s, pos.getZ(i) * s * (1 - y * 0.25));
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const lobe = simplex2(x * 2.3 + y * 1.1, z * 2.3 - y * 1.7) * 0.2 + (hi ? simplex2(x * 5.1 - z * 2, y * 5.1 + x * 3) * 0.1 : mid ? simplex2(x * 4 + 3, z * 4 - y * 2) * 0.07 : 0);
+    const s = 0.95 + lobe + Math.max(0, -y) * 0.08;
+    const sy = y > 0 ? 1.25 : 0.8;
+    pos.setXYZ(i, x * s * (1 - y * 0.12), y * sy * s, z * s * (1 - y * 0.12));
+    const under = 0.42 + 0.58 * smoothstep(-0.7, 0.55, y + lobe * 0.8);
+    col[i * 3] = under; col[i * 3 + 1] = under; col[i * 3 + 2] = under * 0.96;
   }
   crown.translate(0, 2.3, 0);
   crown.computeVertexNormals();
-  crown.deleteAttribute("uv");
-  crown.setAttribute("color", new THREE.BufferAttribute(new Float32Array(pos.count * 3).fill(1), 3));
+  crown.setAttribute("color", new THREE.BufferAttribute(col, 3));
   return crown;
 }
 
 /** Near tree: 80-face crown + open 5-sided trunk. */
 function treeGeometry() {
-  const crown = crownGeometry("ico1");
+  const crown = crownGeometry("ico2");
   const trunk = new THREE.CylinderGeometry(0.12, 0.18, 1.6, 5, 1, true); trunk.translate(0, 0.8, 0);
   const tc = new Float32Array(trunk.attributes.position.count * 3);
   for (let i = 0; i < tc.length; i += 3) { tc[i] = 0.45; tc[i + 1] = 0.35; tc[i + 2] = 0.3; }
   trunk.setAttribute("color", new THREE.BufferAttribute(tc, 3));
   trunk.deleteAttribute("uv");
-  return mergeGeometries([crown, trunk.toNonIndexed()])!;
+  const tn = trunk.toNonIndexed();
+  return mergeGeometries([crown.toNonIndexed(), tn])!;
 }
 
 function nearAirport(x: number, z: number, margin: number) {
@@ -765,34 +838,47 @@ export function buildWorld(parked: ParkedTemplate): World {
     shadowOff.set(...c.off);
   };
   setShadowMode("exterior");
-  const hemi = new THREE.HemisphereLight("#bcd4ff", "#4a4535", 0.6);
+  const hemi = new THREE.HemisphereLight("#c8d6ec", "#4a4535", 0.6);
   scene.add(hemi);
   const fog = new THREE.FogExp2("#b9c9da", 1 / 42000);
   scene.fog = fog;
 
+  const sunDir = new THREE.Vector3(), sunDirRef = sunDir;
   // terrain + water
   const terrain = buildTerrainMesh();
   scene.add(terrain.mesh);
   const wn = waterNormalTexture();
   wn.repeat.set(1800, 1800);
-  const water = new THREE.Mesh(new THREE.PlaneGeometry(TERRAIN.size, TERRAIN.size).rotateX(-Math.PI / 2), new THREE.MeshPhysicalMaterial({ color: "#123447", roughness: 0.06, metalness: 0, normalMap: wn, normalScale: new THREE.Vector2(0.4, 0.4), clearcoat: 0.5, envMapIntensity: 1.2 }));
+  const waterMat = new THREE.MeshPhysicalMaterial({ color: "#0b2c3c", roughness: 0.1, metalness: 0, normalMap: wn, normalScale: new THREE.Vector2(0.55, 0.55), envMapIntensity: 1.5, ior: 1.33, specularIntensity: 1 });
+  waterMat.onBeforeCompile = (sh) => {
+    // fresnel: near-normal view sees dark water body, grazing view mirrors the sky
+    sh.fragmentShader = sh.fragmentShader.replace("#include <opaque_fragment>", `
+      float wF = pow(1.0 - clamp(dot(normalize(vViewPosition), normal), 0.0, 1.0), 3.0);
+      outgoingLight = mix(outgoingLight * 0.6, outgoingLight + reflectedLight.indirectSpecular * 1.7, wF * 0.9);
+      #include <opaque_fragment>`);
+  };
+  addHaze(waterMat, 30000);
+  const water = new THREE.Mesh(new THREE.PlaneGeometry(TERRAIN.size, TERRAIN.size).rotateX(-Math.PI / 2), waterMat);
   water.position.set(TERRAIN.cx, WATER_LEVEL, TERRAIN.cz);
   water.receiveShadow = true;
   scene.add(water);
   const wn2 = wn.clone(); wn2.repeat.set(9000, 9000);
-  const farRing = new THREE.Mesh(new THREE.RingGeometry(TERRAIN.size * 0.7, 400000, 64, 1).rotateX(-Math.PI / 2), new THREE.MeshStandardMaterial({ color: "#3e5230", roughness: 1 }));
+  const ringMat = new THREE.MeshStandardMaterial({ color: "#555b37", roughness: 1 });
+  addHaze(ringMat, 22000);
+  const farRing = new THREE.Mesh(new THREE.RingGeometry(TERRAIN.size * 0.7, 400000, 64, 1).rotateX(-Math.PI / 2), ringMat);
   farRing.position.set(TERRAIN.cx, -30, TERRAIN.cz);
   scene.add(farRing);
 
   // shared materials
   const glowMap = glowTexture();
-  const grassTex = grassDetailTexture();
+  const concreteTex = concreteTexture();
   const mats: Record<string, THREE.Material> = {
-    asphalt: new THREE.MeshStandardMaterial({ map: asphaltTexture(), roughness: 0.88, metalness: 0 }),
-    concrete: new THREE.MeshStandardMaterial({ map: concreteTexture(), roughness: 0.85 }),
-    grass: new THREE.MeshStandardMaterial({ map: grassTex, color: "#6f8c47", roughness: 1 }),
-    paint: new THREE.MeshStandardMaterial({ color: "#eeeeea", roughness: 0.65 }),
-    yellow: new THREE.MeshStandardMaterial({ color: "#e3b12a", roughness: 0.65 }),
+    asphalt: new THREE.MeshPhysicalMaterial({ map: asphaltTexture(3, true), roughness: 0.95, metalness: 0, specularIntensity: 0.25 }),
+    concrete: new THREE.MeshPhysicalMaterial({ map: concreteTex, roughness: 0.9, specularIntensity: 0.3 }),
+    taxi: new THREE.MeshPhysicalMaterial({ map: concreteTex, color: "#cfcac2", roughness: 0.9, specularIntensity: 0.3 }),
+    grass: new THREE.MeshPhysicalMaterial({ map: airfieldGrassTexture(), color: "#ffffff", roughness: 1, specularIntensity: 0.2 }),
+    paint: new THREE.MeshPhysicalMaterial({ map: paintTexture(), color: "#e2e1da", roughness: 0.85, specularIntensity: 0.3 }),
+    yellow: new THREE.MeshPhysicalMaterial({ map: paintTexture(), color: "#d8ab2c", roughness: 0.85, specularIntensity: 0.3 }),
     yellowPaint: new THREE.MeshStandardMaterial({ color: "#d9a520", roughness: 0.5 }),
     facade: new THREE.MeshStandardMaterial({ color: "#c9ccd0", roughness: 0.6, metalness: 0.1 }),
     roof: new THREE.MeshStandardMaterial({ color: "#8a8e93", roughness: 0.8 }),
@@ -811,6 +897,7 @@ export function buildWorld(parked: ParkedTemplate): World {
     tireMap: new THREE.MeshBasicMaterial({ map: tireMarksTexture() }),
     glowMap: new THREE.SpriteMaterial({ map: glowMap }),
   };
+  for (const k of ["asphalt", "concrete", "taxi", "grass", "paint", "yellow"]) groundTone(mats[k]);
   const lightPts = { pos: [] as number[], col: [] as number[] };
   const airports = AIRPORTS.map((a, i) => buildAirport(scene, a, i === 0, mats, parked.parts, lightPts));
   const lg = new THREE.BufferGeometry();
@@ -823,7 +910,18 @@ export function buildWorld(parked: ParkedTemplate): World {
 
   // trees: binned into 2.5 km cells, three LODs per cell (80 faces / 20 faces / octahedron), culled beyond ~20 km
   const rnd = mulberry(2024);
-  const treeM = new THREE.MeshStandardMaterial({ color: "#ffffff", vertexColors: true, roughness: 0.95 });
+  const treeM = new THREE.MeshStandardMaterial({ color: "#ffffff", vertexColors: true, roughness: 0.95, envMapIntensity: 0.5 });
+  const leafTex = grassDetailTexture();
+  treeM.onBeforeCompile = (sh) => {
+    sh.uniforms.leafMap = { value: leafTex };
+    sh.vertexShader = "varying vec3 vObjP;\n" + sh.vertexShader.replace("#include <begin_vertex>", "#include <begin_vertex>\n vObjP = position;");
+    sh.fragmentShader = "uniform sampler2D leafMap; varying vec3 vObjP;\n" + sh.fragmentShader.replace("#include <color_fragment>", `#include <color_fragment>
+      float lf1 = texture2D(leafMap, vObjP.xz * 1.9 + vObjP.yy * vec2(0.7, 1.3)).r;
+      float lf2 = texture2D(leafMap, vObjP.xz * 6.1 - vObjP.yy * vec2(1.9, 0.6)).g;
+      diffuseColor.rgb *= clamp(0.3 + 1.0 * lf1 + 0.9 * lf2 * lf1, 0.35, 1.5);`);
+  };
+  groundTone(treeM, 0.55, 0.5);
+  addHaze(treeM, 22000);
   const NT = 14000;
   const treeBins = new InstanceBins(2500);
   const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), sv = new THREE.Vector3(), pv = new THREE.Vector3();
@@ -845,14 +943,14 @@ export function buildWorld(parked: ParkedTemplate): World {
       q.setFromAxisAngle(yAxis, rnd() * 6.28);
       sv.set(s * (0.8 + rnd() * 0.4), s * (0.9 + rnd() * 0.5), s * (0.8 + rnd() * 0.4));
       m4.compose(pv, q, sv);
-      colr.setHSL(0.24 + rnd() * 0.08, 0.35 + rnd() * 0.25, 0.14 + rnd() * 0.1);
+      colr.setHSL(0.15 + rnd() * 0.1, 0.22 + rnd() * 0.22, 0.12 + rnd() * 0.09 + (rnd() < 0.15 ? 0.05 : 0));
       treeBins.add(m4, colr);
       placed++;
     }
   }
   const treeGroup = new THREE.Group();
   treeGroup.matrixAutoUpdate = false;
-  const treeChunks = buildChunks(treeBins, [treeGeometry(), crownGeometry("ico0"), crownGeometry("octa")], treeM,
+  const treeChunks = buildChunks(treeBins, [treeGeometry(), crownGeometry("ico1"), crownGeometry("octa")], treeM,
     [{ cast: true, recv: true }, { cast: true, recv: true }, { cast: false, recv: false }], treeGroup);
   scene.add(treeGroup);
 
@@ -896,20 +994,24 @@ export function buildWorld(parked: ParkedTemplate): World {
   const bldChunks = buildChunks(bldBins, [roofG], bMat, [{ cast: true, recv: true }], bldGroup);
   scene.add(bldGroup);
 
-  // clouds: one instanced camera-facing octagon per puff, re-sorted back to front at a low rate
+  // clouds: a few cumulus groups (flat base, domed top), one instanced camera-facing octagon per puff, re-sorted back to front at a low rate
   const puff = softPuffTexture(5);
-  const cp: number[] = [], cs: number[] = [], ct: number[] = [];
-  for (let c = 0; c < 55; c++) {
-    const cx = -15000 + rnd() * 75000, cz = -22000 + rnd() * 44000, cy = 1500 + rnd() * 700;
-    if (Math.abs(cz - 1600) < 2500 && cx > -3000 && cx < 44000 && rnd() < 0.6) continue;
-    const n = 8 + Math.floor(rnd() * 10);
-    const size = 350 + rnd() * 450;
+  const cp: number[] = [], cs: number[] = [], ct: number[] = [], ch: number[] = [];
+  for (let c = 0; c < 26; c++) {
+    const cx = -15000 + rnd() * 75000, cz = -24000 + rnd() * 48000, base = 1500 + rnd() * 600;
+    if (Math.abs(cz - 1600) < 2500 && cx > -3000 && cx < 44000 && rnd() < 0.7) continue;
+    const W = 1200 + rnd() * 2600, Dp = 700 + rnd() * 1300, Ht = 500 + rnd() * 900;
+    const n = 26 + Math.floor(rnd() * 16);
     for (let i = 0; i < n; i++) {
-      const ox = (rnd() - 0.5) * size * 2.2, oz = (rnd() - 0.5) * size * 1.6, oy = rnd() * size * 0.45 * (1 - Math.abs(ox) / (size * 1.2));
-      cp.push(cx + ox, cy + oy, cz + oz);
-      const ss = size * (0.7 + rnd() * 0.8) * (1 - Math.abs(ox) / (size * 2.4));
+      const a = rnd() * 6.283, rr = Math.sqrt(rnd());
+      const ox = Math.cos(a) * rr * W * 0.5, oz = Math.sin(a) * rr * Dp * 0.5;
+      const dome = Math.pow(Math.max(0, 1 - rr * rr), 0.7);
+      const hh = rnd() * Ht * dome;
+      const ss = (320 + rnd() * 420) * (0.45 + 0.55 * dome) * (1 + (1 - hh / Ht) * 0.3);
+      cp.push(cx + ox, base + hh + ss * 0.28 * 0.8, cz + oz);
       cs.push(ss, ss * 0.8);
       ct.push(i % 3);
+      ch.push(Math.min(1, hh / Ht + 0.15 * rnd()));
     }
   }
   const NC = ct.length;
@@ -928,37 +1030,49 @@ export function buildWorld(parked: ParkedTemplate): World {
   const aPos = new THREE.InstancedBufferAttribute(new Float32Array(NC * 3), 3);
   const aSize = new THREE.InstancedBufferAttribute(new Float32Array(NC * 2), 2);
   const aTint = new THREE.InstancedBufferAttribute(new Float32Array(NC), 1);
-  aPos.setUsage(THREE.DynamicDrawUsage); aSize.setUsage(THREE.DynamicDrawUsage); aTint.setUsage(THREE.DynamicDrawUsage);
-  cloudGeo.setAttribute("iPos", aPos); cloudGeo.setAttribute("iSize", aSize); cloudGeo.setAttribute("iTint", aTint);
+  const aH = new THREE.InstancedBufferAttribute(new Float32Array(NC), 1);
+  aPos.setUsage(THREE.DynamicDrawUsage); aSize.setUsage(THREE.DynamicDrawUsage); aTint.setUsage(THREE.DynamicDrawUsage); aH.setUsage(THREE.DynamicDrawUsage);
+  cloudGeo.setAttribute("iPos", aPos); cloudGeo.setAttribute("iSize", aSize); cloudGeo.setAttribute("iTint", aTint); cloudGeo.setAttribute("iH", aH);
   cloudGeo.instanceCount = NC;
-  const cloudTints = [new THREE.Color(), new THREE.Color(), new THREE.Color()];
   const cloudU = THREE.UniformsUtils.clone(THREE.UniformsLib.fog) as Record<string, THREE.IUniform>;
-  cloudU.map = { value: puff }; cloudU.tints = { value: cloudTints }; cloudU.opacity = { value: 0.85 };
+  cloudU.map = { value: puff }; cloudU.opacity = { value: 1 };
+  cloudU.sunV = { value: new THREE.Vector3(0, 1, 0) };
+  cloudU.sunCol = { value: new THREE.Color(1, 1, 1) }; cloudU.shadeCol = { value: new THREE.Color(0.5, 0.56, 0.68) };
   const cloudMat = new THREE.ShaderMaterial({
     uniforms: cloudU, transparent: true, depthWrite: false, fog: true,
     vertexShader: `
-      attribute vec3 iPos; attribute vec2 iSize; attribute float iTint;
-      varying vec2 vUv; varying float vTint;
+      attribute vec3 iPos; attribute vec2 iSize; attribute float iTint; attribute float iH;
+      varying vec2 vUv; varying float vH; varying float vFlip;
       #include <fog_pars_vertex>
       void main() {
-        vUv = uv; vTint = iTint;
+        vUv = uv; vH = iH;
+        vFlip = 1.0;
+        if (iTint > 0.5 && iTint < 1.5) { vUv.x = 1.0 - vUv.x; vFlip = -1.0; }
         vec4 mvPosition = modelViewMatrix * vec4(iPos, 1.0);
         mvPosition.xy += position.xy * iSize;
         gl_Position = projectionMatrix * mvPosition;
         #include <fog_vertex>
       }`,
     fragmentShader: `
-      uniform sampler2D map; uniform vec3 tints[3]; uniform float opacity;
-      varying vec2 vUv; varying float vTint;
+      uniform sampler2D map; uniform float opacity; uniform vec3 sunV; uniform vec3 sunCol; uniform vec3 shadeCol;
+      varying vec2 vUv; varying float vH; varying float vFlip;
       #include <fog_pars_fragment>
       void main() {
         vec4 t = texture2D(map, vUv);
-        gl_FragColor = vec4(tints[int(vTint + 0.5)] * t.rgb, t.a * opacity);
+        if (t.a < 0.01) discard;
+        vec3 n = normalize(t.rgb * 2.0 - 1.0);
+        n.x *= vFlip;
+        float d = dot(n, sunV) * 0.5 + 0.5;
+        float lit = smoothstep(0.3, 0.8, d);
+        lit *= mix(0.45, 1.0, smoothstep(0.0, 0.7, vH));
+        vec3 c = mix(shadeCol * mix(0.8, 1.0, vH), sunCol, lit);
+        gl_FragColor = vec4(c, t.a * opacity);
         #include <fog_fragment>
       }`,
   });
   const clouds = new THREE.Mesh(cloudGeo, cloudMat);
   clouds.frustumCulled = false; clouds.matrixAutoUpdate = false;
+  clouds.onBeforeRender = (_r, _s, cam) => { cloudU.sunV.value.copy(sunDirRef).transformDirection(cam.matrixWorldInverse); };
   scene.add(clouds);
   const cOrder = new Uint16Array(NC), cKey = new Float32Array(NC);
   for (let i = 0; i < NC; i++) cOrder[i] = i;
@@ -967,13 +1081,13 @@ export function buildWorld(parked: ParkedTemplate): World {
   const sortClouds = (cam: THREE.Vector3) => {
     for (let i = 0; i < NC; i++) { const dx = cp[i * 3] - cam.x, dy = cp[i * 3 + 1] - cam.y, dz = cp[i * 3 + 2] - cam.z; cKey[i] = dx * dx + dy * dy + dz * dz; }
     cOrder.sort(cCmp);
-    const pa = aPos.array as Float32Array, sa = aSize.array as Float32Array, ta = aTint.array as Float32Array;
+    const pa = aPos.array as Float32Array, sa = aSize.array as Float32Array, ta = aTint.array as Float32Array, ha = aH.array as Float32Array;
     for (let k = 0; k < NC; k++) {
       const i = cOrder[k];
       pa[k * 3] = cp[i * 3]; pa[k * 3 + 1] = cp[i * 3 + 1]; pa[k * 3 + 2] = cp[i * 3 + 2];
-      sa[k * 2] = cs[i * 2]; sa[k * 2 + 1] = cs[i * 2 + 1]; ta[k] = ct[i];
+      sa[k * 2] = cs[i * 2]; sa[k * 2 + 1] = cs[i * 2 + 1]; ta[k] = ct[i]; ha[k] = ch[i];
     }
-    aPos.needsUpdate = true; aSize.needsUpdate = true; aTint.needsUpdate = true;
+    aPos.needsUpdate = true; aSize.needsUpdate = true; aTint.needsUpdate = true; aH.needsUpdate = true;
   };
 
   // stars
@@ -1004,7 +1118,6 @@ export function buildWorld(parked: ParkedTemplate): World {
   let pmrem: THREE.PMREMGenerator | null = null;
   let envRT: THREE.WebGLRenderTarget | null = null;
 
-  const sunDir = new THREE.Vector3();
   const tgt = new THREE.Vector3();
   const tmpC = new THREE.Color(), tmpC2 = new THREE.Color();
   let lodX = 1e9, lodY = 0, lodZ = 0;
@@ -1033,17 +1146,20 @@ export function buildWorld(parked: ParkedTemplate): World {
       sun.intensity = 3.4 * smoothstep(-1.5, 8, t.elev) + (t.elev < 0 ? 0.12 : 0);
       if (t.elev < -1) { sun.color.set("#9fb4ff"); }
       hemi.intensity = 0.15 + 0.55 * day;
-      hemi.color.set(new THREE.Color("#1b2640").lerp(new THREE.Color(warm > 0.5 ? "#bcd4ff" : "#f2c7a0"), day));
+      hemi.color.set(new THREE.Color("#1b2640").lerp(new THREE.Color(warm > 0.5 ? "#c8d6ec" : "#f2c7a0"), day));
       hemi.groundColor.set(new THREE.Color("#0b0b0e").lerp(new THREE.Color("#4a4535"), day));
       const fogC = new THREE.Color("#0b1020").lerp(new THREE.Color(warm > 0.4 ? "#b7c8da" : "#d9b28f"), day);
       fog.color.copy(fogC);
       fog.density = 1 / lerp(30000, 45000, warm);
       envGround.material.color.set(new THREE.Color("#0a0b0c").lerp(new THREE.Color("#4b5540"), day));
       tmpC2.set("#1a2030").lerp(tmpC.set(warm > 0.4 ? "#ffffff" : "#ffd9bd"), day);
-      for (let i = 0; i < 3; i++) cloudTints[i].copy(tmpC2).multiplyScalar(0.92 + i * 0.04);
-      cloudU.opacity.value = 0.55 + day * 0.35;
+      const expo = lerp(0.9, 0.52, day);
+      const gain = 1.25 / expo;
+      (cloudU.sunCol.value as THREE.Color).set(warm > 0.4 ? "#fffaf0" : "#ffc9a0").multiplyScalar(gain * (0.015 + 0.985 * day * day));
+      (cloudU.shadeCol.value as THREE.Color).set(warm > 0.4 ? "#8e9fba" : "#9a8a96").lerp(tmpC2.set("#1c2438"), 1 - day).multiplyScalar(gain * (0.012 + 0.988 * day * day));
+      cloudU.opacity.value = 1;
       starM.opacity = 1 - smoothstep(-8, -2, t.elev);
-      renderer.toneMappingExposure = lerp(0.9, 0.52, day);
+      renderer.toneMappingExposure = expo;
       bMat.emissiveIntensity = (1 - day) * 1.6;
       lightMat.opacity = 0.35 + (1 - day) * 0.65;
       lightMat.size = lerp(11, 7, day);

@@ -48,17 +48,24 @@ function airportFlatten(x: number, z: number, h: number) {
   return h;
 }
 
+/** rounded ridges: fewer octaves blended with smooth noise (only used in the far mountain regions) */
+function softRidge(x: number, y: number, oct: number) {
+  const r = ridged(x, y, oct), b = 0.5 + 0.5 * fbm(x * 0.9 + 11, y * 0.9 - 5, 3);
+  const m = 0.55 * r + 0.45 * b * 0.8;
+  return m * (0.6 + 0.4 * m);
+}
+
 export function rawHeight(x: number, z: number) {
   let h = 28 + 38 * fbm(x / 7000, z / 7000, 5) + 9 * fbm(x / 900, z / 900, 3);
   // northern mountain range
   const north = smoothstep(-9000, -26000, z);
-  if (north > 0) h += north * (ridged(x / 8500 + 3.1, z / 8500 - 1.7, 6) * 2100 + 180 * fbm(x / 2000, z / 2000, 4));
+  if (north > 0) h += north * (softRidge(x / 8500 + 3.1, z / 8500 - 1.7, 4) * 2050 + 180 * fbm(x / 2000, z / 2000, 4));
   // southern hills
   const south = smoothstep(14000, 30000, z);
-  if (south > 0) h += south * (ridged(x / 6000 - 7.3, z / 6000 + 2.2, 5) * 700);
+  if (south > 0) h += south * (softRidge(x / 6000 - 7.3, z / 6000 + 2.2, 4) * 700);
   // western hills
   const west = smoothstep(-8000, -24000, x);
-  if (west > 0) h += west * ridged(x / 7000, z / 7000 + 4.4, 5) * 900;
+  if (west > 0) h += west * softRidge(x / 7000, z / 7000 + 4.4, 4) * 900;
   // sea to the south-east
   const sea = smoothstep(46000, 60000, x) * smoothstep(-2000, 12000, z);
   h = lerp(h, -60 + 20 * fbm(x / 3000, z / 3000, 3), sea);
