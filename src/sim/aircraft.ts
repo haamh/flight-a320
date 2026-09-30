@@ -462,7 +462,7 @@ export function buildAircraft(): AircraftRig {
     dark: new THREE.MeshStandardMaterial({ color: "#1d2024", roughness: 0.6, metalness: 0.3 }),
     glass: flightDeckGlass(),
     seal: new THREE.MeshStandardMaterial({ color: "#121416", roughness: 0.55, metalness: 0.1 }),
-    winFrame: new THREE.MeshStandardMaterial({ color: "#8a929c", roughness: 0.75, metalness: 0.05 }),
+    winFrame: new THREE.MeshStandardMaterial({ color: "#5a626d", roughness: 0.7, metalness: 0.05 }),
     pylon: new THREE.MeshPhysicalMaterial({ color: "#c9ced4", roughness: 0.38, metalness: 0.3, clearcoat: 0.6, side: THREE.DoubleSide }),
   };
 
@@ -556,7 +556,7 @@ export function buildAircraft(): AircraftRig {
     glassG.push(paneShape(w, w.outline2, null, -0.004));
     sealG.push(paneShape(w, offsetOutline(w, 0.018), offsetOutline(w, -0.012), 0.0035));
     // interior window frame (covers the lining cut-out)
-    frameG.push(paneShape(w, offsetOutline(w, 0.075), offsetOutline(w, -0.008), -0.075, 0.062));
+    frameG.push(paneShape(w, offsetOutline(w, 0.05), offsetOutline(w, -0.006), -0.062, 0.045));
   }
   const glass = new THREE.Mesh(mergeGeometries(glassG), M.glass);
   glass.renderOrder = 5;
@@ -988,7 +988,7 @@ export function buildAircraft(): AircraftRig {
 
   /* ---------------- Cockpit interior ---------------- */
   const cockpit = new THREE.Group(); root.add(cockpit);
-  const lining = new THREE.MeshStandardMaterial({ color: "#8f969e", roughness: 0.85, side: THREE.BackSide, alphaMap: liv.liningAlpha, alphaTest: 0.5 });
+  const lining = new THREE.MeshStandardMaterial({ color: "#6f7883", roughness: 0.9, side: THREE.BackSide, alphaMap: liv.liningAlpha, alphaTest: 0.5 });
   {
     const zl: number[] = [];
     for (let z = -18.2; z <= -11.9; z += 0.06) zl.push(z);
