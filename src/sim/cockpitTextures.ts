@@ -17,7 +17,9 @@ const FONT = "'Arial Narrow','Helvetica Neue',Arial,'Liberation Sans','DejaVu Sa
 export interface Part { k: "box" | "cyl" | "tog"; x: number; y: number; w: number; h: number; d: number }
 export interface Anchor { x: number; y: number; w: number; h: number; d: number }
 export interface Face { c: HTMLCanvasElement; ctx: CanvasRenderingContext2D; w: number; h: number; s: number }
-export interface Panel { face: Face; parts: Part[]; anchors: Record<string, Anchor> }
+/** clickable control: rect in panel mm; `led` = lit-legend rect (pushbuttons) drawn as an emissive overlay when on */
+export interface HotSpot { id: string; label: string; kind: "button" | "knob" | "toggle"; x: number; y: number; w: number; h: number; led?: { x: number; y: number; w: number; h: number; col: string }; up?: boolean }
+export interface Panel { face: Face; parts: Part[]; anchors: Record<string, Anchor>; hot: HotSpot[] }
 
 export function mkFace(wMm: number, hMm: number, ppm: number): Face {
   const { c, ctx } = makeCanvas(Math.round(wMm * ppm), Math.round(hMm * ppm));
@@ -64,10 +66,11 @@ function paintBase(f: Face, col: string, seed = 1, grain = 6) {
 }
 
 export class Sink {
-  parts: Part[] = []; anchors: Record<string, Anchor> = {}; ox = 0; oy = 0;
+  parts: Part[] = []; anchors: Record<string, Anchor> = {}; hots: HotSpot[] = []; ox = 0; oy = 0;
   constructor(public f: Face) {}
   get ctx() { return this.f.ctx; }
-  panel(): Panel { return { face: this.f, parts: this.parts, anchors: this.anchors }; }
+  panel(): Panel { return { face: this.f, parts: this.parts, anchors: this.anchors, hot: this.hots }; }
+  hot(h: HotSpot) { this.hots.push({ ...h, x: h.x + this.ox, y: h.y + this.oy, led: h.led ? { ...h.led, x: h.led.x + this.ox, y: h.led.y + this.oy } : undefined }); }
   /** shift the drawing origin (canvas and recorded parts stay in step) */
   shift(dx: number, dy: number) { this.f.ctx.translate(dx, dy); this.ox += dx; this.oy += dy; }
   box(x: number, y: number, w: number, h: number, d: number) { this.parts.push({ k: "box", x: x + this.ox, y: y + this.oy, w, h, d }); }
@@ -76,7 +79,7 @@ export class Sink {
   anchor(n: string, x: number, y: number, w: number, h: number, d = 0) { this.anchors[n] = { x: x + this.ox, y: y + this.oy, w, h, d }; }
 }
 
-export interface PbOpt { t?: string; b?: string; tc?: string; bc?: string; tl?: boolean; bl?: boolean; size?: number; flat?: boolean }
+export interface PbOpt { t?: string; b?: string; tc?: string; bc?: string; tl?: boolean; bl?: boolean; size?: number; flat?: boolean; id?: string; label?: string }
 /** square airbus pushbutton: black cap, upper (FAULT) and lower (OFF/ON) legend halves; (cx,cy) = centre */
 export function pb(S: Sink, cx: number, cy: number, w: number, h: number, o: PbOpt = {}) {
   const { ctx } = S;
@@ -95,6 +98,13 @@ export function pb(S: Sink, cx: number, cy: number, w: number, h: number, o: PbO
     T(ctx, o.b, cx, both ? cy + h * 0.2 : cy, sz, lit ? c : COL.dim);
   }
   if (!o.flat) S.box(cx - w / 2, cy - h / 2, w, h, 4.2);
+  if (o.id) {
+    // lit legend: the lower (ON/OFF...) half, or the whole cap for single-legend buttons
+    const lower = !!o.b, lc = lower ? (o.bc ?? COL.wht) : (o.tc ?? COL.amb);
+    const lh = both ? h / 2 - 2.2 : h - 3;
+    S.hot({ id: o.id, label: o.label ?? o.id, kind: "button", x: cx - w / 2, y: cy - h / 2, w, h,
+      led: { x: cx - w / 2 + 1.6, y: lower && both ? cy + 0.6 : cy - lh / 2, w: w - 3.2, h: lh, col: lc } });
+  }
 }
 /** knob: round black cap with white pointer; ang in degrees clockwise from up */
 export function knob(S: Sink, cx: number, cy: number, r: number, ang: number, d = 9, cap = "#16181b") {
@@ -116,9 +126,10 @@ export function ticks(S: Sink, cx: number, cy: number, r: number, items: [number
     if (s) T(ctx, s, cx + Math.sin(rad) * (r + 5.4), cy - Math.cos(rad) * (r + 5.4) , size, col);
   }
 }
-function toggleSw(S: Sink, cx: number, cy: number, up = true) {
+function toggleSw(S: Sink, cx: number, cy: number, up = true, id?: string, label?: string) {
   const { ctx } = S;
   disc(ctx, cx, cy, 3.4, "#15171a", "#6c747e", 0.5);
+  if (id) { S.hot({ id, label: label ?? id, kind: "toggle", x: cx - 7, y: cy - 9, w: 14, h: 18, up }); return; } // moving lever built in 3D
   disc(ctx, cx, cy + (up ? -0.8 : 0.8), 1.6, "#b7bec6");
   S.tog(cx, cy, 2.2, 7);
 }
@@ -350,13 +361,14 @@ export function glareshield(): Panel {
   };
   win("spd", -150, "SPD   MACH"); win("hdg", -82, "HDG   TRK", "LAT"); win("alt", 44, "ALT", "LVL/CH"); win("vs", 114, "V/S   FPA", "");
   // knobs
-  const fk = (X: number, y: number, r: number, lab: string, ang: number) => { knob(S, gx(X), y, r, ang, 11); T(ctx, lab, gx(X), y + r + 5, 3.4, COL.leg); };
+  const fk = (X: number, y: number, r: number, lab: string, ang: number) => { knob(S, gx(X), y, r, ang, 11); T(ctx, lab, gx(X), y + r + 5, 3.4, COL.leg); S.hot({ id: "fcu_" + lab.replace("/", "").toLowerCase(), label: `${lab} knob (scroll to set, click to push)`, kind: "knob", x: gx(X) - r - 2, y: y - r - 2, w: r * 2 + 4, h: r * 2 + 4 }); };
   fk(-150, 322, 11, "SPD", 10); fk(-82, 322, 11, "HDG", -20); fk(44, 322, 11, "ALT", 5); fk(114, 322, 11, "V/S", -8);
   disc(ctx, gx(44), 322, 15, "rgba(0,0,0,0)", "#55606b", 0.8);
   T(ctx, "100", gx(44) + 20, 316, 2.6, COL.leg, "left"); T(ctx, "1000", gx(44) + 20, 328, 2.6, COL.leg, "left");
   // centre buttons
   const fb = (name: string, X: number, y: number, lab: string, w = 25, h = 21) => {
     pb(S, gx(X), y, w, h, { t: lab, tc: COL.wht, tl: true, size: 3.6 });
+    S.hot({ id: "fcu_" + name, label: lab + " pushbutton", kind: "button", x: gx(X) - w / 2, y: y - h / 2, w, h });
     S.anchor("bar_" + name, gx(X) - w / 2 + 3, y + h / 2 - 5, w - 6, 2.6, 4.45);
   };
   fb("ap1", -31, 268, "AP1"); fb("ap2", -3, 268, "AP2"); fb("athr", -17, 293, "A/THR", 27);
@@ -376,6 +388,7 @@ export function glareshield(): Panel {
       T(ctx, lab, gx(mx), y - 6, 4.4, col === COL.red ? "#551518" : "#553a06"); T(ctx, "MASTER", gx(mx), y - 13, 3, COL.dimLeg);
       S.box(gx(mx) - 25, y - 21, 50, 42, 4.2);
       S.anchor(`${name}${m < 0 ? "L" : "R"}`, gx(mx) - 22, y - 18, 44, 36, 4.5);
+      S.hot({ id: name, label: `MASTER ${lab} (click to reset)`, kind: "button", x: gx(mx) - 25, y: y - 21, w: 50, h: 42 });
     };
     mb("mw", 292, "WARN", COL.red); mb("mc", 346, "CAUT", COL.amb);
     // side stick priority
@@ -498,7 +511,7 @@ export function pedestal(): Panel {
     T(ctx, `MASTER ${n}`, x, 930, 3.6, COL.wht);
     rr(ctx, x - 13, 936, 26, 11, 1.5); ctx.fillStyle = "#0b0c0e"; ctx.fill();
     T(ctx, "FAULT", x - 6, 941.5, 2.4, "#4a2a06"); T(ctx, "FIRE", x + 7, 941.5, 2.4, "#4a1014");
-    toggleSw(S, x, 966, true); T(ctx, "ON", x + 14, 960, 3, COL.leg, "left"); T(ctx, "OFF", x + 14, 972, 3, COL.leg, "left");
+    toggleSw(S, x, 966, true, `eng_master${n}`, `ENG MASTER ${n}`); T(ctx, "ON", x + 14, 960, 3, COL.leg, "left"); T(ctx, "OFF", x + 14, 972, 3, COL.leg, "left");
     rr(ctx, x - 12, 955, 24, 22, 1.5); ctx.strokeStyle = COL.red; ctx.lineWidth = 0.6; ctx.stroke();
   });
   ticks(S, 160, 962, 11, [[-55, "CRANK"], [0, "NORM"], [55, "IGN/START"]], 3.2, COL.leg); knob(S, 160, 962, 11, 0, 9);
@@ -580,7 +593,8 @@ export function overheadPanel(): Panel {
   const FP = { t: "FAULT", b: "OFF" } as PbOpt;
   const lamp = (x: number, y: number, w: number, h: number, txt: string, col: string) => { rr(ctx, x - w / 2, y - h / 2, w, h, 1.5); ctx.fillStyle = "#0a0b0c"; ctx.fill(); ctx.strokeStyle = "#30353b"; ctx.lineWidth = 0.5; ctx.stroke(); T(ctx, txt, x, y, 3.2, col); };
   const guard = (x: number, y: number, w: number, h: number) => { ctx.strokeStyle = COL.red; ctx.lineWidth = 0.9; ctx.strokeRect(x - w / 2, y - h / 2, w, h); };
-  const tog = (x: number, y: number, up: boolean) => toggleSw(S, x, y, up);
+  const tog = (x: number, y: number, up: boolean, id?: string, label?: string) => toggleSw(S, x, y, up, id, label);
+  const idOf = (s: string) => "ovh_" + s.toLowerCase().replace(/[^a-z0-9]+/g, "_");
   type Pn = { h: number; t: string; d: (x: number, y: number, w: number) => void };
   const lay = (x0: number, w: number, list: Pn[]) => {
     const tot = list.reduce((a, p) => a + p.h, 0), gap = (H - 26 - tot) / (list.length - 1);
@@ -600,7 +614,7 @@ export function overheadPanel(): Panel {
       lamp(x + 30, y + 14, 38, 11, "ON BAT", COL.amb);
       [0, 1, 2].forEach((i) => { const cx = x + 48 + i * 97; lab(`IR ${i + 1}`, cx, y + 14, 4, COL.wht); B(cx, y + 36, FP); B(cx, y + 66, { t: "FAULT", b: "ALIGN", bc: COL.wht, size: 2.6 }); K(cx, y + 100, 0, [[-55, "OFF"], [0, "NAV"], [55, "ATT"]], 9); });
       lab("ADR", x + 12, y + 36, 3); lab("IR", x + 10, y + 66, 3); } },
-    { h: 66, t: "FLT CTL", d: (x, y) => ["ELAC 1", "SEC 1", "FAC 1"].forEach((n, i) => { const cx = x + 48 + i * 97; B(cx, y + 26, FP); lab(n, cx, y + 50, 3.4, COL.wht); }) },
+    { h: 66, t: "FLT CTL", d: (x, y) => ["ELAC 1", "SEC 1", "FAC 1"].forEach((n, i) => { const cx = x + 48 + i * 97; B(cx, y + 26, { ...FP, id: idOf(n), label: n }); lab(n, cx, y + 50, 3.4, COL.wht); }) },
     { h: 78, t: "EVAC", d: (x, y) => {
       B(x + 50, y + 30, { t: "HORN", b: "SHUT OFF", bc: COL.wht, size: 2.4 }); guard(x + 150, y + 30, 36, 34); B(x + 150, y + 30, { t: "COMMAND", tc: COL.wht, size: 2.4 });
       tog(x + 240, y + 34, true); lab("CAPT &", x + 240, y + 20, 3); lab("PURS", x + 240, y + 26, 3); lab("CAPT", x + 240, y + 50, 3); } },
@@ -610,7 +624,7 @@ export function overheadPanel(): Panel {
       guard(x + 150, y + 44, 38, 36); B(x + 150, y + 44, { t: "MAN", b: "ON", bc: COL.blu, tc: COL.wht }); lab("RAT & EMER GEN", x + 160, y + 70, 2.8);
       B(x + 240, y + 44, { t: "TEST", tc: COL.wht, size: 3 }); lab("EMER GEN TEST", x + 240, y + 70, 2.8); } },
     { h: 84, t: "GPWS", d: (x, y) => {
-      ["SYS", "G/S MODE", "FLAP MODE", "TERR"].forEach((n, i) => { const cx = x + 34 + i * 74; B(cx, y + 30, FP); lab(n, cx, y + 54, 3, COL.wht); });
+      ["SYS", "G/S MODE", "FLAP MODE", "TERR"].forEach((n, i) => { const cx = x + 34 + i * 74; B(cx, y + 30, { ...FP, id: idOf("gpws " + n), label: "GPWS " + n }); lab(n, cx, y + 54, 3, COL.wht); });
       tog(x + 120, y + 70, true); lab("LDG FLAP 3", x + 170, y + 70, 3.4, COL.wht); } },
     { h: 62, t: "RCDR", d: (x, y) => {
       B(x + 50, y + 26, { t: "", b: "ON", bc: COL.blu }); lab("GND CTL", x + 50, y + 49, 3.2, COL.wht);
@@ -623,7 +637,7 @@ export function overheadPanel(): Panel {
     { h: 62, t: "CALLS", d: (x, y) => ["MECH", "ALL", "FWD", "AFT"].forEach((n, i) => { const cx = x + 34 + i * 74; B(cx, y + 26, { t: "CALL", tc: COL.amb, b: "", size: 3.2 }); lab(n, cx, y + 49, 3.2, COL.wht); }) },
     { h: 80, t: "WIPER", d: (x, y) => {
       K(x + 60, y + 34, 0, [[-60, "OFF"], [0, "SLOW"], [60, "FAST"]], 11); lab("CAPT", x + 60, y + 62, 3.4, COL.wht);
-      B(x + 170, y + 30, { t: "", b: "ON", bc: COL.blu }); lab("RAIN RPLNT", x + 170, y + 54, 3);
+      B(x + 170, y + 30, { t: "", b: "ON", bc: COL.blu, id: "rain_rplnt", label: "RAIN REPELLENT" }); lab("RAIN RPLNT", x + 170, y + 54, 3);
       B(x + 240, y + 30, { t: "", b: "WASH", bc: COL.wht, size: 2.8 }); lab("WASHER", x + 240, y + 54, 3); } },
     { h: 84, t: "FLOOD / INTEG LT", d: (x, y) => [["MAIN PNL", -20], ["OVHD INTEG", 30], ["FLOOD LT", 60], ["STBY COMPASS", 0]].forEach(([n, a], i) => { const cx = x + 40 + i * 70; K(cx, y + 36, a as number, [[-130, ""], [130, ""]], 10); lab(n as string, cx, y + 62, 2.8, COL.wht); }) },
     { h: 78, t: "CKPT DOOR", d: (x, y) => {
@@ -644,43 +658,43 @@ export function overheadPanel(): Panel {
     }) },
     { h: 112, t: "HYD", d: (x, y) => {
       [["GREEN", "ENG 1 PUMP", 62, "#35d66a"], ["BLUE", "ELEC PUMP", 164, "#2fb0ff"], ["YELLOW", "ENG 2 PUMP", 266, "#ffd21a"]].forEach(([nm, pl, dx, col]) => {
-        const cx = x + (dx as number); lab(nm as string, cx, y + 14, 3.8, col as string); B(cx, y + 36, FP); lab(pl as string, cx, y + 56, 3, COL.wht); line(ctx, cx, y + 62, cx, y + 72, col as string, 2); });
+        const cx = x + (dx as number); lab(nm as string, cx, y + 14, 3.8, col as string); B(cx, y + 36, { ...FP, id: idOf(pl as string), label: pl as string }); lab(pl as string, cx, y + 56, 3, COL.wht); line(ctx, cx, y + 62, cx, y + 72, col as string, 2); });
       line(ctx, x + 62, y + 72, x + 266, y + 72, "#6f7883", 1.2);
       B(x + 62, y + 92, FP); B(x + 164, y + 92, { t: "", b: "ON", bc: COL.blu }); B(x + 266, y + 92, FP);
       lab("PTU", x + 113, y + 92, 3.4, COL.wht); lab("RAT MAN ON", x + 215, y + 92, 3, COL.wht); } },
     { h: 104, t: "FUEL", d: (x, y) => {
       [["L TK", 65], ["CTR TK", 165], ["R TK", 265]].forEach(([n, dx]) => lab(n as string, x + (dx as number), y + 14, 3.6, COL.wht));
-      [0, 1, 2, 3, 4, 5].forEach((i) => { B(x + 40 + i * 50, y + 34, FP); lab(String(i % 2 + 1), x + 40 + i * 50, y + 54, 3.2); });
+      [0, 1, 2, 3, 4, 5].forEach((i) => { B(x + 40 + i * 50, y + 34, { ...FP, id: `ovh_fuel_pump${i}`, label: `FUEL ${["L TK", "L TK", "CTR TK", "CTR TK", "R TK", "R TK"][i]} PUMP ${i % 2 + 1}` }); lab(String(i % 2 + 1), x + 40 + i * 50, y + 54, 3.2); });
       line(ctx, x + 30, y + 62, x + 300, y + 62, "#6f7883", 1);
       B(x + 90, y + 80, { t: "FAULT", b: "AUTO", bc: COL.wht }); lab("MODE SEL", x + 140, y + 80, 3.2);
       B(x + 210, y + 80, { t: "", b: "OPEN", bc: COL.blu }); lab("X FEED", x + 260, y + 80, 3.2); } },
     { h: 108, t: "ELEC", d: (x, y) => {
-      ["BAT 1", "BAT 2", "GEN 1", "GEN 2", "APU GEN", "EXT PWR"].forEach((n, i) => { const cx = x + 40 + i * 50; B(cx, y + 32, i === 5 ? { t: "AVAIL", tc: COL.grn, b: "ON", bc: COL.blu } : FP); lab(n, cx, y + 52, 2.8); });
+      ["BAT 1", "BAT 2", "GEN 1", "GEN 2", "APU GEN", "EXT PWR"].forEach((n, i) => { const cx = x + 40 + i * 50; B(cx, y + 32, { ...(i === 5 ? { t: "AVAIL", tc: COL.grn, b: "ON", bc: COL.blu } : FP), id: idOf(n), label: n }); lab(n, cx, y + 52, 2.8); });
       ["IDG 1", "BUS TIE", "AC ESS FEED", "GALY & CAB", "COMMERCIAL", "IDG 2"].forEach((n, i) => { const cx = x + 40 + i * 50; B(cx, y + 78, i === 0 || i === 5 ? { t: "FAULT", b: "DISC", bc: COL.wht } : i === 1 ? { t: "", b: "ALL", bc: COL.wht } : FP); lab(n, cx, y + 98, 2.6); }); } },
     { h: 108, t: "AIR COND", d: (x, y) => {
       [["COCKPIT", 44], ["FWD CAB", 104], ["AFT CAB", 164]].forEach(([n, dx]) => { const cx = x + (dx as number); K(cx, y + 30, 0, [[-110, "C"], [110, "H"]], 11); lab(n as string, cx, y + 54, 2.8); });
       K(x + 238, y + 30, 0, [[-60, "SHUT"], [0, "AUTO"], [60, "OPEN"]], 10, "X BLEED"); K(x + 296, y + 30, 0, [[-50, "LO"], [0, "NORM"], [50, "HI"]], 9, "FLOW");
-      ["PACK 1", "HOT AIR", "PACK 2", "ENG 1 BLEED", "APU BLEED", "ENG 2 BLEED"].forEach((n, i) => { const cx = x + 40 + i * 50; B(cx, y + 76, FP); lab(n, cx, y + 96, 2.6); }); } },
+      ["PACK 1", "HOT AIR", "PACK 2", "ENG 1 BLEED", "APU BLEED", "ENG 2 BLEED"].forEach((n, i) => { const cx = x + 40 + i * 50; B(cx, y + 76, { ...FP, id: idOf(n), label: n }); lab(n, cx, y + 96, 2.6); }); } },
     { h: 64, t: "ANTI ICE", d: (x, y) => {
-      ["ENG 1", "WING", "ENG 2"].forEach((n, i) => { const cx = x + 50 + i * 100; B(cx, y + 28, { t: "FAULT", b: "ON", bc: COL.blu }); lab(n, cx, y + 50, 3.2, COL.wht); });
-      B(x + 290, y + 28, { t: "", b: "ON", bc: COL.blu }); lab("PROBE/WDW HEAT", x + 285, y + 50, 2.4); } },
+      ["ENG 1", "WING", "ENG 2"].forEach((n, i) => { const cx = x + 50 + i * 100; B(cx, y + 28, { t: "FAULT", b: "ON", bc: COL.blu, id: idOf("anti ice " + n), label: `${n} ANTI ICE` }); lab(n, cx, y + 50, 3.2, COL.wht); });
+      B(x + 290, y + 28, { t: "", b: "ON", bc: COL.blu, id: "probe_heat", label: "PROBE/WINDOW HEAT" }); lab("PROBE/WDW HEAT", x + 285, y + 50, 2.4); } },
     { h: 72, t: "CABIN PRESS", d: (x, y) => {
       B(x + 50, y + 28, { t: "FAULT", b: "MAN", bc: COL.blu }); lab("MODE SEL", x + 50, y + 52, 3);
       K(x + 150, y + 30, 0, [[-90, "-2"], [0, "AUTO"], [90, "14"]], 11, "LDG ELEV");
       tog(x + 250, y + 32, false); lab("UP", x + 250, y + 18, 3); lab("DN", x + 250, y + 46, 3); lab("V/S CTL", x + 290, y + 32, 2.8); } },
     { h: 92, t: "EXT LT", d: (x, y) => {
-      [["STROBE", 0], ["BEACON", 1], ["WING", 1], ["NAV & LOGO", 0]].forEach(([n, up], i) => { const cx = x + 40 + i * 82; tog(cx, y + 32, !!up); lab(n as string, cx, y + 16, 3, COL.wht); lab("ON", cx, y + 22, 2.4); lab("OFF", cx, y + 44, 2.4); });
-      [["RWY TURN OFF", 1], ["L LAND", 0], ["R LAND", 0], ["NOSE", 0]].forEach(([n, up], i) => { const cx = x + 40 + i * 82; tog(cx, y + 72, !!up); lab(n as string, cx, y + 56, 3, COL.wht); lab("OFF", cx, y + 84, 2.4); }); } },
+      [["STROBE", 0], ["BEACON", 1], ["WING", 1], ["NAV & LOGO", 0]].forEach(([n, up], i) => { const cx = x + 40 + i * 82; tog(cx, y + 32, !!up, "lt_" + ["strobe", "beacon", "wing", "nav"][i], `${n} light`); lab(n as string, cx, y + 16, 3, COL.wht); lab("ON", cx, y + 22, 2.4); lab("OFF", cx, y + 44, 2.4); });
+      [["RWY TURN OFF", 1], ["L LAND", 0], ["R LAND", 0], ["NOSE", 0]].forEach(([n, up], i) => { const cx = x + 40 + i * 82; tog(cx, y + 72, !!up, "lt_" + ["rwy", "landL", "landR", "nose"][i], `${n} light`); lab(n as string, cx, y + 56, 3, COL.wht); lab("OFF", cx, y + 84, 2.4); }); } },
     { h: 62, t: "APU", d: (x, y) => {
-      B(x + 100, y + 26, { t: "FAULT", b: "ON", bc: COL.blu }); lab("MASTER SW", x + 100, y + 50, 3.2, COL.wht);
-      B(x + 228, y + 26, { t: "ON", tc: COL.blu, b: "AVAIL", bc: COL.grn }); lab("START", x + 228, y + 50, 3.2, COL.wht); } },
-    { h: 62, t: "SIGNS / INT LT", d: (x, y) => [["SEAT BELTS", 0], ["NO SMOKING", 20], ["EMER EXIT LT", 0], ["DOME", -40]].forEach(([n, a], i) => { const cx = x + 40 + i * 82; K(cx, y + 26, a as number, [[-90, ""], [0, ""], [90, ""]], 9); lab(n as string, cx, y + 50, 2.8, COL.wht); }) },
+      B(x + 100, y + 26, { t: "FAULT", b: "ON", bc: COL.blu, id: "apu_master", label: "APU MASTER SW" }); lab("MASTER SW", x + 100, y + 50, 3.2, COL.wht);
+      B(x + 228, y + 26, { t: "ON", tc: COL.blu, b: "AVAIL", bc: COL.grn, id: "apu_start", label: "APU START" }); lab("START", x + 228, y + 50, 3.2, COL.wht); } },
+    { h: 62, t: "SIGNS / INT LT", d: (x, y) => [["SEAT BELTS", 0], ["NO SMOKING", 20], ["EMER EXIT LT", 0], ["DOME", -40]].forEach(([n, a], i) => { const cx = x + 40 + i * 82; K(cx, y + 26, a as number, [[-90, ""], [0, ""], [90, ""]], 9); S.hot({ id: idOf("sign " + n), label: `${n} selector`, kind: "knob", x: cx - 11, y: y + 15, w: 22, h: 22 }); lab(n as string, cx, y + 50, 2.8, COL.wht); }) },
   ]);
 
   // ---------- right column ----------
   lay(660, 290, [
     { h: 100, t: "FLT CTL", d: (x, y) => {
-      ["ELAC 2", "SEC 2", "SEC 3", "FAC 2"].forEach((n, i) => { const cx = x + 38 + i * 71; B(cx, y + 28, FP); lab(n, cx, y + 50, 3.2, COL.wht); });
+      ["ELAC 2", "SEC 2", "SEC 3", "FAC 2"].forEach((n, i) => { const cx = x + 38 + i * 71; B(cx, y + 28, { ...FP, id: idOf(n), label: n }); lab(n, cx, y + 50, 3.2, COL.wht); });
       B(x + 70, y + 76, { t: "", b: "ON", bc: COL.blu }); lab("GND CTL", x + 130, y + 76, 3.2); } },
     { h: 104, t: "CARGO SMOKE", d: (x, y) => {
       lamp(x + 70, y + 18, 48, 11, "SMOKE", COL.red); lamp(x + 220, y + 18, 48, 11, "SMOKE", COL.red);
@@ -691,7 +705,7 @@ export function overheadPanel(): Panel {
       ["BLOWER", "EXTRACT"].forEach((n, i) => { const cx = x + 50 + i * 72; B(cx, y + 30, { t: "FAULT", b: "OVRD", bc: COL.wht, size: 2.6 }); lab(n, cx, y + 52, 3, COL.wht); });
       B(x + 210, y + 30, { t: "", b: "OFF", bc: COL.wht }); lab("CAB FANS", x + 210, y + 52, 3, COL.wht);
       B(x + 50, y + 74, FP); lab("LAV & GALLEY", x + 130, y + 74, 2.8); B(x + 240, y + 74, { t: "", b: "OFF", bc: COL.wht }); } },
-    { h: 86, t: "ENG", d: (x, y) => [1, 2].forEach((n, i) => { const cx = x + 70 + i * 150; B(cx, y + 30, { t: "FAULT", b: "ON", bc: COL.blu }); lab(`${n} MAN START`, cx, y + 52, 3, COL.wht); lab(`ENG ${n}`, cx, y + 68, 3, COL.wht); }) },
+    { h: 86, t: "ENG", d: (x, y) => [1, 2].forEach((n, i) => { const cx = x + 70 + i * 150; B(cx, y + 30, { t: "FAULT", b: "ON", bc: COL.blu, id: `eng_manstart${n}`, label: `ENG ${n} MAN START` }); lab(`${n} MAN START`, cx, y + 52, 3, COL.wht); lab(`ENG ${n}`, cx, y + 68, 3, COL.wht); }) },
     { h: 84, t: "WIPER", d: (x, y) => {
       K(x + 60, y + 34, 0, [[-60, "OFF"], [0, "SLOW"], [60, "FAST"]], 11); lab("F/O", x + 60, y + 62, 3.4, COL.wht);
       B(x + 170, y + 30, { t: "", b: "ON", bc: COL.blu }); lab("RAIN RPLNT", x + 170, y + 54, 3);

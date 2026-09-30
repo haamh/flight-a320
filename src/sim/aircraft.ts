@@ -427,6 +427,7 @@ export interface AircraftRig {
   eye: V3;
   update: (s: VisualState, dt: number, time: number) => void;
   screens: CockpitRig["screens"];
+  controls: CockpitRig["controls"];
   wheelContacts: { nose: V3; left: V3; right: V3 };
   hardPoints: { name: string; p: V3 }[];
   lightPositions: { beaconTop: V3 };
@@ -558,6 +559,12 @@ export function buildAircraft(): AircraftRig {
     // interior window frame (covers the lining cut-out)
     frameG.push(paneShape(w, offsetOutline(w, 0.05), offsetOutline(w, -0.006), -0.062, 0.045));
   }
+  // dark flight-deck backing seen through the glass when the interior is culled (distant views, parked aircraft)
+  const backG: THREE.BufferGeometry[] = [];
+  for (const w of WINDOWS) backG.push(paneShape(w, offsetOutline(w, 0.02), null, -0.32));
+  const backing = new THREE.Mesh(mergeGeometries(backG), new THREE.MeshStandardMaterial({ color: "#1a1d22", roughness: 0.9, side: THREE.DoubleSide }));
+  backing.name = "windowBacking"; backing.visible = false;
+  ext.add(backing);
   const glass = new THREE.Mesh(mergeGeometries(glassG), M.glass);
   glass.renderOrder = 5;
   ext.add(glass);
@@ -1080,6 +1087,7 @@ export function buildAircraft(): AircraftRig {
   return {
     root, eye, update,
     screens: flightDeck.screens,
+    controls: flightDeck.controls,
     wheelContacts: {
       nose: V(0, -GEAR_HEIGHT + nwR - nwR, NOSE_PIVOT.z),
       left: V(-3.55, -GEAR_HEIGHT, 0.9),

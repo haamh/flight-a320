@@ -27,7 +27,7 @@ export const CAM_MODES: { id: CamMode; name: string }[] = [
 export interface SimMessage { text: string; kind: "info" | "warn" | "good" | "bad"; t: number }
 /** frame statistics: smoothed fps / frame ms, CPU and (when the browser exposes timer queries) GPU ms, render scale (fraction of the pixel-ratio cap), whole-frame draw calls / triangles */
 export interface PerfStats { fps: number; ms: number; cpuMs: number; gpuMs: number; scale: number; calls: number; tris: number }
-export type SimTelemetry = Telemetry & { cam: CamMode; paused: boolean; lights: boolean; perf: PerfStats };
+export type SimTelemetry = Telemetry & { cam: CamMode; paused: boolean; lights: boolean; perf: PerfStats; hover: string };
 export interface SimCallbacks {
   onTelemetry: (t: SimTelemetry) => void;
   onMessage: (m: SimMessage) => void;
@@ -78,7 +78,8 @@ export class Sim {
   /** live frame statistics (also delivered through onTelemetry) */
   perf: PerfStats = { fps: 60, ms: 16.7, cpuMs: 0, gpuMs: 0, scale: 1, calls: 0, tris: 0 };
   /** dynamic resolution: off under browser automation (software GL is always "slow") */
-  dynRes = typeof navigator === "undefined" || !navigator.webdriver;
+  /** dynamic resolution: off by default (buffer reallocation on a scale change can flash a blank frame); toggle with O */
+  dynRes = false;
   /** true when the reversed float depth buffer is active (otherwise logarithmic depth is the fallback) */
   readonly reversedDepth: boolean;
   private keys = new Set<string>();
@@ -118,6 +119,7 @@ export class Sim {
   private audioArgs = { n1: 0, ias: 0, gs: 0, onGround: true, gearMoving: false, gearDown: true, inside: false, reverser: 0, spoilers: 0 };
   private interior: THREE.Object3D[] = [];
   private interiorOn = true;
+  private windowBacking: THREE.Object3D | null = null;
   // frame timing / dynamic resolution
   private cap: number;
   private scaleIdx = 0;
@@ -179,6 +181,7 @@ export class Sim {
     this.world = buildWorld(parked);
     this.world.scene.add(rig.root);
     this.interior = rig.root.children.slice(1);
+    this.windowBacking = rig.root.getObjectByName("windowBacking") ?? null;
     this.fm.hardPoints = rig.hardPoints;
     // post
     this.composer.addPass(new RenderPass(this.world.scene, this.camera));
@@ -194,6 +197,7 @@ export class Sim {
       this.smoke.push({ s, v: new THREE.Vector3(), life: 0 });
     }
     this.bindInput();
+    this.syncControls();
     this.resetDeparture();
     this.paused = true;
     this.running = true;
@@ -260,24 +264,33 @@ export class Sim {
     };
     const ku = (e: KeyboardEvent) => this.keys.delete(e.key.toLowerCase());
     const onBlur = () => this.keys.clear();
-    const onDown = (e: MouseEvent) => { this.dragging = true; this.lastMouse = [e.clientX, e.clientY]; };
-    const onUp = () => (this.dragging = false);
+    let downAt = [0, 0], downT = 0, downBtn = 0;
+    const onDown = (e: MouseEvent) => { this.dragging = true; this.lastMouse = [e.clientX, e.clientY]; downAt = [e.clientX, e.clientY]; downT = performance.now(); downBtn = e.button; };
+    const onUp = (e: MouseEvent) => {
+      const wasDrag = !this.dragging || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5 || performance.now() - downT > 450;
+      this.dragging = false;
+      if (!wasDrag && e.target === el && this.cam === "cockpit") { const h = this.pick(e.clientX, e.clientY); if (h) this.cockpitAction(h.userData.hot.id, downBtn === 2 ? -1 : 1, "click"); }
+    };
+    const onCtx = (e: MouseEvent) => { if (this.cam === "cockpit") e.preventDefault(); };
+    el.addEventListener("contextmenu", onCtx);
     window.addEventListener("keydown", kd);
     window.addEventListener("keyup", ku);
     window.addEventListener("blur", onBlur);
     el.addEventListener("mousedown", onDown);
     window.addEventListener("mouseup", onUp);
     const onMove = (e: MouseEvent) => {
+      this.mouseXY[0] = e.clientX; this.mouseXY[1] = e.clientY; this.hoverDirty = true;
       if (!this.dragging) return;
       const dx = e.clientX - this.lastMouse[0], dy = e.clientY - this.lastMouse[1];
       this.lastMouse = [e.clientX, e.clientY];
       if (this.cam === "cockpit" || this.cam === "cabin") {
-        this.headYaw -= dx * 0.004; this.headPitch = clamp(this.headPitch - dy * 0.004, -1.2, 1.2);
+        this.headYaw -= dx * 0.004; this.headPitch = clamp(this.headPitch - dy * 0.004, -1.2, 1.5);
       } else { this.orbitYaw -= dx * 0.006; this.orbitPitch = clamp(this.orbitPitch + dy * 0.004, -1.3, 1.4); }
     };
     window.addEventListener("mousemove", onMove);
     el.addEventListener("wheel", (e) => {
       e.preventDefault();
+      if (this.cam === "cockpit") { const h = this.pick(e.clientX, e.clientY); if (h && (h.userData.hot.kind === "knob" || h.userData.hot.kind === "lever")) { this.cockpitAction(h.userData.hot.id, e.deltaY < 0 ? 1 : -1, "wheel"); return; } }
       if (this.cam === "cockpit" || this.cam === "cabin" || this.cam === "tower" || this.cam === "flyby") this.zoom = clamp(this.zoom * (e.deltaY > 0 ? 1.08 : 0.92), 0.25, 1.6);
       else this.orbitDist = clamp(this.orbitDist * (e.deltaY > 0 ? 1.1 : 0.9), 8, 900);
     }, { passive: false });
@@ -292,7 +305,87 @@ export class Sim {
   private zoom = 1;
   private cleanup: () => void = () => {};
 
-  private onKeyPress(k: string, e: KeyboardEvent) {
+  /* ---------------- clickable flight deck ---------------- */
+  private raycaster = new THREE.Raycaster();
+  private ndc = new THREE.Vector2();
+  private mouseXY = [0, 0];
+  private hoverDirty = false;
+  private hovered: THREE.Object3D | null = null;
+  /** label of the control under the mouse (HUD tooltip) */
+  hoverLabel = "";
+  /** switch / pushbutton states that have no flight-model counterpart */
+  panel: Record<string, boolean> = { eng_master1: true, eng_master2: true, ovh_bat_1: false, ovh_bat_2: false, lt_wing: false, lt_rwy: true, ovh_sign_seat_belts: true, ovh_sign_no_smoking: true, probe_heat: true };
+  private pick(cx: number, cy: number): THREE.Object3D | null {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    this.ndc.set(((cx - r.left) / r.width) * 2 - 1, -((cy - r.top) / r.height) * 2 + 1);
+    this.raycaster.setFromCamera(this.ndc, this.camera);
+    this.raycaster.far = 3;
+    const hits = this.raycaster.intersectObjects(this.rig.controls.pickables, false);
+    return hits.length ? hits[0].object : null;
+  }
+  private updateHover() {
+    if (!this.hoverDirty && this.frame % 10) return;
+    this.hoverDirty = false;
+    const h = this.cam === "cockpit" && !this.dragging ? this.pick(this.mouseXY[0], this.mouseXY[1]) : null;
+    if (h !== this.hovered) {
+      this.hovered = h;
+      this.rig.controls.hover(h);
+      this.hoverLabel = h ? h.userData.hot.label : "";
+      this.renderer.domElement.style.cursor = h ? "pointer" : "";
+    }
+  }
+  /** keep switch positions / lit legends in step with the systems they drive */
+  private syncControls() {
+    const set = this.rig.controls.set, L = this.lights, c = this.ctl;
+    set("lt_strobe", L.strobe); set("lt_beacon", L.beacon); set("lt_nav", L.nav);
+    set("lt_landL", L.landing); set("lt_landR", L.landing); set("lt_nose", L.taxi);
+    for (const [k, v] of Object.entries(this.panel)) set(k, v);
+    void c;
+  }
+  private cockpitAction(id: string, dir: number, how: "click" | "wheel") {
+    const fm = this.fm, c = this.ctl, L = this.lights, P = this.panel;
+    const tog = (k: string, label: string) => { P[k] = !P[k]; this.msg(`${label} ${P[k] ? "ON" : "OFF"}`, "info"); };
+    this.audio.click();
+    switch (id) {
+      case "fcu_ap1": case "fcu_ap2": this.onKeyPress("k", null); break;
+      case "fcu_athr": this.onKeyPress("u", null); break;
+      case "fcu_loc": case "fcu_appr": this.onKeyPress("j", null); break;
+      case "fcu_exped": this.msg("EXPED not available in this simulation", "warn"); break;
+      case "fcu_spd":
+        if (how === "wheel") { fm.apSpd = clamp(Math.round(fm.apSpd / KT + dir) * KT, 100 * KT, 350 * KT); if (!fm.athr) this.msg(`SPD ${Math.round(fm.apSpd / KT)} (A/THR off)`, "info"); }
+        else { fm.athr = true; this.msg(`A/THR ON - SPD ${Math.round(fm.apSpd / KT)} kt`, "good"); }
+        break;
+      case "fcu_hdg":
+        if (how === "wheel") fm.apHdg = ((Math.round(fm.apHdg) + dir) % 360 + 360) % 360;
+        else if (!fm.onGround) { fm.ap = "HDG/ALT"; this.msg(`HDG ${Math.round(fm.apHdg)} selected`, "good"); }
+        break;
+      case "fcu_alt":
+        if (how === "wheel") fm.apAlt = Math.max(100 / 3.28084, fm.apAlt + dir * 100 / 3.28084);
+        else if (!fm.onGround) { fm.ap = "HDG/ALT"; this.msg(`ALT ${Math.round(fm.apAlt * 3.28084 / 100) * 100} ft`, "good"); }
+        break;
+      case "fcu_vs": this.msg("V/S mode not modelled - altitude is flown in OP/ALT", "info"); break;
+      case "mw": case "mc": this.msg("Master light reset", "info"); break;
+      case "gear": this.onKeyPress("g", null); break;
+      case "flaps": this.onKeyPress(dir > 0 ? "f" : "v", null); break;
+      case "spdbrk": this.onKeyPress("b", null); break;
+      case "park": this.onKeyPress("p", null); break;
+      case "thrust": {
+        if (how === "wheel") { c.throttle = clamp(c.throttle + dir * 0.04, 0, 1); fm.athr = false; }
+        else { const det = [0, 0.8, 0.9, 1], i = det.findIndex((d) => d > c.throttle + 0.01); const cur = i < 0 ? 3 : Math.max(0, i - 1); const n = clamp(cur + dir, 0, 3); c.throttle = det[n]; fm.athr = false; this.msg(["IDLE", "CL", "FLX/MCT", "TOGA"][n], "info"); }
+        break;
+      }
+      case "lt_strobe": L.strobe = !L.strobe; this.msg(`Strobe ${L.strobe ? "ON" : "OFF"}`, "info"); break;
+      case "lt_beacon": L.beacon = !L.beacon; this.msg(`Beacon ${L.beacon ? "ON" : "OFF"}`, "info"); break;
+      case "lt_nav": L.nav = !L.nav; this.msg(`Nav & logo lights ${L.nav ? "ON" : "OFF"}`, "info"); break;
+      case "lt_landL": case "lt_landR": L.landing = !L.landing; this.msg(`Landing lights ${L.landing ? "ON" : "OFF"}`, "info"); break;
+      case "lt_nose": L.taxi = !L.taxi; this.msg(`Nose light ${L.taxi ? "TAXI" : "OFF"}`, "info"); break;
+      case "eng_master1": case "eng_master2": tog(id, `ENG MASTER ${id.slice(-1)}`); if (!P.eng_master1 && !P.eng_master2 && !fm.onGround) this.msg("Both engines shut down!", "bad"); break;
+      default: tog(id, this.rig.controls.pickables.find((o) => o.userData.hot.id === id)?.userData.hot.label ?? id);
+    }
+    this.syncControls();
+  }
+
+  private onKeyPress(k: string, e: KeyboardEvent | null) {
     const c = this.ctl, fm = this.fm;
     if (k === "escape") { this.paused = !this.paused; return; }
     if (this.paused && k !== "c" && !/^[1-7]$/.test(k) && k !== "h") return;
@@ -321,12 +414,14 @@ export class Sim {
       case "c": { const i = CAM_MODES.findIndex((m) => m.id === this.cam); this.setCam(CAM_MODES[(i + 1) % CAM_MODES.length].id); break; }
       case "h": this.hudVisible = !this.hudVisible; break;
       case "i": this.perfVisible = !this.perfVisible; break;
+      case "o": this.dynRes = !this.dynRes; if (!this.dynRes && this.scaleIdx) this.setScale(0); this.msg(this.dynRes ? "Dynamic resolution ON" : "Dynamic resolution OFF (full resolution)", "info"); break;
       case "m": this.audio.enabled = !this.audio.enabled; this.msg(this.audio.enabled ? "Sound ON" : "Sound OFF", "info"); break;
       case "n": this.setTimeOfDay((this.timeIdx + 1) % TIMES.length); this.msg("Time: " + TIMES[this.timeIdx].name, "info"); break;
       default:
         if (/^[1-7]$/.test(k)) this.setCam(CAM_MODES[parseInt(k) - 1].id);
     }
     void e;
+    if (this.rig) this.syncControls();
   }
 
   private readControls(dt: number) {
@@ -630,10 +725,11 @@ export class Sim {
     this.rig.update(this.visual(), this.paused ? 0 : dt, this.simTime + this.frame * 0.0001);
     if (this.menuOrbit) this.orbitYaw += dt * 0.06;
     this.updateCamera(dt);
+    this.updateHover();
     // interior is only ever seen through the windows from nearby: hide it from distant exterior cameras
     const inside = this.cam === "cockpit" || this.cam === "cabin";
     const showInterior = inside || this.camera.position.distanceToSquared(fm.pos) < 45 * 45;
-    if (showInterior !== this.interiorOn) { this.interiorOn = showInterior; for (const o of this.interior) o.visible = showInterior; }
+    if (showInterior !== this.interiorOn) { this.interiorOn = showInterior; for (const o of this.interior) o.visible = showInterior; if (this.windowBacking) this.windowBacking.visible = !showInterior; }
     this.world.setShadowMode(this.cam === "cockpit" ? "deck" : this.cam === "cabin" ? "cabin" : "exterior");
     this.world.update(this.simTime, dt, this.camera.position, fm.pos, fm.quat);
     // smoke
@@ -667,7 +763,7 @@ export class Sim {
       if (dEWD) { drawEWD(s.ewd.getContext("2d")!, s.ewd.width, tel); s.refresh(["ewd"]); }
       if (dSD) { drawSD(s.sd.getContext("2d")!, s.sd.width, tel); s.refresh(["sd"]); }
       if (panelDue) { this.lastPanelT = t0; s.panel(tel); }
-      if (cbDue) { this.lastTelT = t0; this.cb.onTelemetry({ ...tel, cam: this.cam, paused: this.paused, lights: this.lights.landing, perf: { ...this.perf } }); }
+      if (cbDue) { this.lastTelT = t0; this.cb.onTelemetry({ ...tel, cam: this.cam, paused: this.paused, lights: this.lights.landing, perf: { ...this.perf }, hover: this.hoverLabel }); }
     }
     this.vignette.uniforms.time.value = this.simTime;
     // whole-frame renderer statistics (the composer issues several render calls per frame)

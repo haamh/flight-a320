@@ -22,8 +22,9 @@ const KEYS: [string, string][] = [
   ["L", "Landing / taxi lights"],
   ["C or 1-7", "Cameras"],
   ["Mouse drag / wheel", "Look / orbit / zoom"],
+  ["Click cockpit controls", "Buttons, switches, levers (scroll knobs)"],
   ["N", "Cycle time of day"],
-  ["I", "Performance overlay"],
+  ["I / O", "Performance overlay / dynamic resolution"],
   ["H", "Hide HUD   ·   M  Mute   ·   Esc  Pause"],
 ];
 
@@ -101,7 +102,7 @@ export default function App() {
       {/* HUD */}
       {started && t && hud && (
         <>
-          <div className="absolute top-4 left-4 rounded-xl bg-black/60 border border-white/10 px-4 py-3 text-xs shadow-2xl min-w-[260px]">
+          <div className="pointer-events-none absolute top-4 left-4 rounded-xl bg-black/60 border border-white/10 px-4 py-3 text-xs shadow-2xl min-w-[260px]">
             <div className="flex items-center gap-2 text-[11px] tracking-[0.2em] text-sky-300 font-semibold">AERIS 320 · A320-214</div>
             <div className="mt-1 text-lg font-bold tracking-wide">EAUR <span className="text-white/40">→</span> EBVR</div>
             <div className="text-white/60">{phase}</div>
@@ -151,7 +152,7 @@ export default function App() {
           </div>
 
           {/* systems */}
-          <div className="absolute bottom-4 right-4 rounded-xl bg-black/65 border border-white/10 p-3 text-[11px] w-[250px] shadow-2xl">
+          <div className="pointer-events-none absolute bottom-4 right-4 rounded-xl bg-black/65 border border-white/10 p-3 text-[11px] w-[250px] shadow-2xl">
             <div className="flex justify-between mb-1"><span className="text-white/50">THRUST</span><span className="font-mono">{t.reverser > 0.5 ? "REV " : ""}{Math.round(t.throttle * 100)}% · N1 {(t.n1 * 100).toFixed(1)}</span></div>
             <Bar v={t.throttle} color={t.reverser > 0.5 ? "bg-amber-400" : "bg-sky-400"} />
             <div className="mt-1"><Bar v={(t.n1 - 0.2) / 0.82} /></div>
@@ -174,6 +175,10 @@ export default function App() {
             </div>
           )}
         </>
+      )}
+
+      {started && t && t.cam === "cockpit" && t.hover && (
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 rounded-md bg-black/75 border border-cyan-300/30 px-3 py-1 text-[12px] text-cyan-100 pointer-events-none">{t.hover}</div>
       )}
 
       {started && t && perfOn && (

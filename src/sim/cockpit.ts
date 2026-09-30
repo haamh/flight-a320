@@ -10,8 +10,19 @@ const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
 
 export type ScreenId = "pfd" | "nd" | "ewd" | "sd";
 
+export interface HotInfo { id: string; label: string; kind: TX.HotSpot["kind"] | "lever" }
+export interface CockpitControls {
+  /** raycast targets (userData.hot: HotInfo) */
+  pickables: THREE.Object3D[];
+  /** lit legend / toggle position */
+  set: (id: string, on: boolean) => void;
+  /** hover outline (null clears) */
+  hover: (obj: THREE.Object3D | null) => void;
+}
+
 export interface CockpitRig {
   group: THREE.Group;
+  controls: CockpitControls;
   screens: {
     pfd: HTMLCanvasElement; nd: HTMLCanvasElement; ewd: HTMLCanvasElement; sd: HTMLCanvasElement;
     /** mark display textures for upload after their canvases were redrawn (default: all) */
@@ -165,6 +176,50 @@ function addParts(mh: Mesher, S: Surf, parts: TX.Part[]) {
   }
 }
 
+/** clickable controls: invisible pick boxes, moving toggle levers and lit-legend overlays */
+class HotBuilder {
+  pickables: THREE.Object3D[] = [];
+  toggles = new Map<string, { piv: THREE.Group; up: boolean }>();
+  leds: { id: string; M: THREE.Matrix4; col: string }[] = [];
+  pickMat = new THREE.MeshBasicMaterial({ visible: false });
+  batG: THREE.BufferGeometry;
+  constructor(public group: THREE.Group, public batMat: THREE.Material) {
+    const m = new Mesher(false, true);
+    m.cyl([0, 0.0065, 0], 0.0016, 0.013, "#c9ced4", "y", 0.0022);
+    m.sph([0, 0.0135, 0], [0.0032, 0.0032, 0.0032], "#e3e6ea");
+    m.cyl([0, 0.0005, 0], 0.0042, 0.002, "#8e949c", "y");
+    this.batG = m.geometry();
+  }
+  basis(S: Surf, cx: number, cy: number) {
+    const o = S.pt(cx, cy), eu = V().subVectors(S.pt(cx + 1, cy), o).normalize(), ev = V().subVectors(S.pt(cx, cy - 1), o).normalize(), en = S.n(cx, cy);
+    const ex = V().crossVectors(ev, en).normalize(); ev.crossVectors(en, ex).normalize();
+    void eu;
+    return new THREE.Matrix4().makeBasis(ex, ev, en).setPosition(o);
+  }
+  add(S: Surf, list: TX.HotSpot[]) {
+    for (const h of list) {
+      const M = this.basis(S, h.x + h.w / 2, h.y + h.h / 2);
+      const info: HotInfo = { id: h.id, label: h.label, kind: h.kind };
+      const pick = new THREE.Mesh(UBOX, this.pickMat);
+      M.clone().multiply(mx([0, 0, 0.006], [0, 0, 0], [h.w / 1000, h.h / 1000, 0.016])).decompose(pick.position, pick.quaternion, pick.scale);
+      pick.userData.hot = info; pick.userData.rect = [h.w / 1000, h.h / 1000];
+      this.group.add(pick); this.pickables.push(pick);
+      if (h.kind === "toggle") {
+        const piv = new THREE.Group(); M.decompose(piv.position, piv.quaternion, piv.scale);
+        const bat = new THREE.Mesh(this.batG, this.batMat); bat.rotation.x = Math.PI / 2; // lever stands off the panel along its normal
+        const tilt = new THREE.Group(); tilt.add(bat); piv.add(tilt);
+        this.group.add(piv);
+        this.toggles.set(h.id, { piv: tilt, up: !!h.up });
+        tilt.rotation.x = h.up ? -0.5 : 0.5;
+      }
+      if (h.led) {
+        const l = h.led, L = this.basis(S, l.x + l.w / 2, l.y + l.h / 2);
+        this.leds.push({ id: h.id, M: L.multiply(mx([0, 0, 0.00455], [0, 0, 0], [l.w / 1000, l.h / 1000, 1])), col: l.col });
+      }
+    }
+  }
+}
+
 /** emissive (integral lighting) from the panel art itself: bright pixels glow, dark body only faintly */
 function glowMat(map: THREE.Texture, flood: number, rough = 0.82) {
   const m = new THREE.MeshStandardMaterial({ map, roughness: rough, metalness: 0, emissive: "#ffffff", emissiveIntensity: 0.2 });
@@ -203,6 +258,7 @@ export function buildCockpit(): CockpitRig {
   const S_PFD = mkScreen(), S_ND = mkScreen(), S_EWD = mkScreen(), S_SD = mkScreen();
   S_PFD.c.getContext("2d")!.fillStyle = "#000";
 
+  const HB = new HotBuilder(group, satin);
   const MT = new Mesher(false, true);   // static matte parts (vertex colours)
   const SA = new Mesher(false, true);   // static satin parts
   const FB = new Mesher(true, false);   // seat fabric
@@ -333,6 +389,7 @@ export function buildCockpit(): CockpitRig {
     // the texture was drawn for 282 mm depth, stretch to the real depth
     addParts(mh, S, gp.parts);
     addMesh(mh, gm(TX.faceTex(gp.face), 0.05));
+    HB.add(S, gp.hot);
     for (const k of ["spd", "hdg", "alt", "vs", "baroL", "baroR", "mwL", "mwR", "mcL", "mcR"]) liveQuad(S, gp.anchors[k], k);
     for (const b of ["ap1", "ap2", "athr", "loc", "exped", "appr", "fdL", "lsL", "fdR", "lsR"]) liveQuad(S, gp.anchors["bar_" + b], "bar_" + b);
     // rear lip + front edge (charcoal)
@@ -361,6 +418,7 @@ export function buildCockpit(): CockpitRig {
     mh.grid(pedS, pedTy.map((ty) => ({ ty, a: 0, b: TX.PED.W })), 1);
     addParts(mh, pedS, pedP.parts);
     addMesh(mh, gm(TX.faceTex(pedP.face), 0.10));
+    HB.add(pedS, pedP.hot);
     for (const k of ["mcdu1", "mcdu2", "rmp1", "rmp2"]) liveQuad(pedS, pedP.anchors[k], k);
     // body: flanks, rear, front
     const hw = TX.PED.W / 2000;
@@ -491,6 +549,7 @@ export function buildCockpit(): CockpitRig {
     addParts(mh, S, ovp.parts);
     const mat = gm(TX.faceTex(ovp.face, 16), 0.04);
     addMesh(mh, mat);
+    HB.add(S, ovp.hot);
     // skirt: panel edge up to the lining
     const up = (p: THREE.Vector3) => V(p.x, roofY(p.z, p.x) + 0.004, p.z);
     const edgeList: THREE.Vector3[][] = [[], [], [], []];
@@ -550,6 +609,24 @@ export function buildCockpit(): CockpitRig {
   /* ---------------- finalise statics ---------------- */
   addMesh(MT, matte); addMesh(SA, satin); addMesh(FB, fabric); addMesh(LV, liveMat);
 
+  // lit legends: one instanced quad per pushbutton, scaled to zero when dark
+  const ledIndex = new Map<string, number>();
+  const ledMesh = new THREE.InstancedMesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ toneMapped: false, transparent: true, opacity: 0.92, depthWrite: false }), Math.max(1, HB.leds.length));
+  const zeroM = new THREE.Matrix4().makeScale(0, 0, 0);
+  HB.leds.forEach((l, i) => { ledIndex.set(l.id, i); ledMesh.setMatrixAt(i, zeroM); ledMesh.setColorAt(i, new THREE.Color(l.col).multiplyScalar(1.6)); });
+  ledMesh.count = HB.leds.length; ledMesh.frustumCulled = false; ledMesh.renderOrder = 3;
+  group.add(ledMesh);
+  // hover outline
+  const hl = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.PlaneGeometry(1, 1)), new THREE.LineBasicMaterial({ color: "#7fe3ff", toneMapped: false, depthTest: false, transparent: true }));
+  hl.visible = false; hl.renderOrder = 20; group.add(hl);
+  // levers are pickable too
+  const lever = (o: THREE.Object3D, id: string, label: string) => o.traverse((c) => { if ((c as THREE.Mesh).isMesh) { c.userData.hot = { id, label, kind: "lever" } as HotInfo; HB.pickables.push(c); } });
+  lever(gearMesh, "gear", "Landing gear lever (click)");
+  lever(flPiv, "flaps", "Flap lever (left click extend / right click retract / scroll)");
+  lever(sbPiv, "spdbrk", "Speed brake lever (click)");
+  lever(pbPiv, "park", "Parking brake (click)");
+  thrL.forEach((g) => lever(g, "thrust", "Thrust levers (scroll, left/right click for detents)"));
+
   const cockpitLight = new THREE.PointLight("#ffe7c4", 0.6, 3.6, 1.5);
   cockpitLight.position.set(0, 1.0, -15.4); group.add(cockpitLight);
 
@@ -583,8 +660,32 @@ export function buildCockpit(): CockpitRig {
     }
   };
 
+  const hlBox = new THREE.Box3(), hlSize = V();
+  const controls: CockpitControls = {
+    pickables: HB.pickables,
+    set: (id, on) => {
+      const t = HB.toggles.get(id);
+      if (t) { t.up = on; t.piv.rotation.x = on ? -0.5 : 0.5; }
+      const i = ledIndex.get(id);
+      if (i !== undefined) { ledMesh.setMatrixAt(i, on ? HB.leds[i].M : zeroM); ledMesh.instanceMatrix.needsUpdate = true; }
+    },
+    hover: (obj) => {
+      if (!obj) { hl.visible = false; return; }
+      const r = obj.userData.rect as [number, number] | undefined;
+      if (r) {
+        hl.position.copy(obj.position); hl.quaternion.copy(obj.quaternion); hl.scale.set(r[0] + 0.004, r[1] + 0.004, 1);
+        hl.translateZ(0.0085); hl.visible = true;
+      } else {
+        // lever: outline its bounding box face toward the pilot
+        hlBox.setFromObject(obj); hlBox.getSize(hlSize); hlBox.getCenter(hl.position);
+        group.worldToLocal(hl.position); hl.quaternion.identity(); hl.scale.set(Math.max(hlSize.x, 0.03), Math.max(hlSize.y, 0.03), 1);
+        hl.visible = true;
+      }
+    },
+  };
+
   return {
-    group, update,
+    group, update, controls,
     screens: {
       pfd: S_PFD.c, nd: S_ND.c, ewd: S_EWD.c, sd: S_SD.c,
       refresh: (which: ScreenId[] = ["pfd", "nd", "ewd", "sd"]) => { const m = { pfd: S_PFD, nd: S_ND, ewd: S_EWD, sd: S_SD }; for (const k of which) m[k].t.needsUpdate = true; },

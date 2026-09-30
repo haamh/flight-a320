@@ -38,6 +38,7 @@ const P = {
   "nose-front-close": { mode: "departure", cam: "gear", orbit: [Math.PI, 0.06, 7.5], target: "nose" },
   "nose-side-close": { mode: "departure", cam: "gear", orbit: [Math.PI / 2 + 0.25, 0.08, 6.5], target: "nose" },
   "ref-34": { mode: "departure", cam: "gear", orbit: [-Math.PI + 0.95, 0.06, 34], target: "mid" },
+  "nose-far": { mode: "departure", cam: "gear", orbit: [Math.PI - 0.5, 0.05, 60], target: "nose" },
   "chase": { mode: "departure", cam: "chase", orbit: [0.4, 0.12, 55] },
 };
 

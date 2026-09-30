@@ -88,6 +88,15 @@ export class SimAudio {
     o.connect(og); og.connect(this.master); o.start(); o.stop(ctx.currentTime + 0.35);
   }
 
+  /** switch / pushbutton click */
+  click() {
+    const ctx = this.ctx; if (!ctx || !this.enabled) return;
+    const s = ctx.createBufferSource(); s.buffer = this.noiseBuf;
+    const f = ctx.createBiquadFilter(); f.type = "bandpass"; f.frequency.value = 3200; f.Q.value = 1.2;
+    const g = ctx.createGain(); g.gain.setValueAtTime(0.35, ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.035);
+    s.connect(f); f.connect(g); g.connect(this.master); s.start(); s.stop(ctx.currentTime + 0.05);
+  }
+
   say(text: string) {
     if (!this.enabled || !("speechSynthesis" in window)) return;
     const u = new SpeechSynthesisUtterance(text);
