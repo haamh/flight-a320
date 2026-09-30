@@ -1,5 +1,5 @@
 // Headless screenshot + render-stats harness.
-// Usage: node tools/snap.mjs [--url http://localhost:5173] [--out shots] [--time 1] preset1 preset2 ...
+// Usage: node tools/snap.mjs [--url http://localhost:5173] [--out shots] [--time 1] [--w 1280 --h 720] [--nopost] preset1 preset2 ...
 // Presets: cockpit, cockpit-wide, cockpit-left, cockpit-up, overhead, pedestal, nose-front, nose-side, nose-34, chase, approach-cockpit
 // Needs the Vite dev server running (npm run dev) because it drives the dev-only window.sim handle.
 import { createRequire } from "module";
@@ -17,6 +17,7 @@ const url = opt("--url", "http://localhost:5173");
 const out = opt("--out", "shots");
 const timeIdx = Number(opt("--time", "1"));
 const w = Number(opt("--w", "1280")), h = Number(opt("--h", "720"));
+const noPost = args.includes("--nopost"); if (noPost) args.splice(args.indexOf("--nopost"), 1);
 const presets = args.length ? args : ["cockpit", "nose-front", "nose-side"];
 fs.mkdirSync(out, { recursive: true });
 
@@ -34,6 +35,9 @@ const P = {
   "nose-front": { mode: "departure", cam: "gear", orbit: [Math.PI, 0.03, 14], target: "nose" },
   "nose-side": { mode: "departure", cam: "gear", orbit: [Math.PI / 2, 0.05, 12], target: "nose" },
   "nose-34": { mode: "departure", cam: "gear", orbit: [Math.PI - 0.75, 0.12, 14], target: "nose" },
+  "nose-front-close": { mode: "departure", cam: "gear", orbit: [Math.PI, 0.06, 7.5], target: "nose" },
+  "nose-side-close": { mode: "departure", cam: "gear", orbit: [Math.PI / 2 + 0.25, 0.08, 6.5], target: "nose" },
+  "ref-34": { mode: "departure", cam: "gear", orbit: [-Math.PI + 0.95, 0.06, 34], target: "mid" },
   "chase": { mode: "departure", cam: "chase", orbit: [0.4, 0.12, 55] },
 };
 
@@ -47,6 +51,8 @@ page.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") 
 page.on("pageerror", (e) => logs.push(`[pageerror] ${e.message}`));
 await page.goto(url, { waitUntil: "load" });
 await page.waitForFunction(() => window.sim && window.sim.running, null, { timeout: 180000 });
+// --nopost: bypass the post-processing chain (software GL renders the HDR chain washed out)
+if (noPost) await page.evaluate(() => { const s = window.sim; s.composer.render = () => s.renderer.render(s.world.scene, s.camera); });
 
 let menuOpen = true;
 for (const name of presets) {
@@ -69,7 +75,7 @@ for (const name of presets) {
     if (p.head) { sim.headYaw = p.head[0]; sim.headPitch = p.head[1]; }
     if (p.orbit) { sim.orbitYaw = p.orbit[0]; sim.orbitPitch = p.orbit[1]; sim.orbitDist = p.orbit[2]; }
     sim.zoom = p.zoom ?? 1;
-    sim.debugTarget = p.target === "nose" ? [0, 0.6, -15.8] : null;
+    sim.debugTarget = p.target === "nose" ? [0, 0.6, -15.8] : p.target === "mid" ? [0, -0.5, -3] : null;
     // let camera fov lerp settle and gather frame timings
     const info = sim.renderer.info;
     const frame = () => new Promise((r) => requestAnimationFrame(() => r()));
