@@ -4,12 +4,21 @@ import { makeCanvas } from "./textures";
 import { lerp } from "./noise";
 import { fuselageSection } from "./fuselage";
 import type { VisualState } from "./aircraft";
+import type { Telemetry } from "./instruments";
 
 const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
 
+export type ScreenId = "pfd" | "nd" | "ewd" | "sd";
+
 export interface CockpitRig {
   group: THREE.Group;
-  screens: { pfd: HTMLCanvasElement; nd: HTMLCanvasElement; ewd: HTMLCanvasElement; sd: HTMLCanvasElement; refresh: () => void };
+  screens: {
+    pfd: HTMLCanvasElement; nd: HTMLCanvasElement; ewd: HTMLCanvasElement; sd: HTMLCanvasElement;
+    /** mark display textures for upload after their canvases were redrawn (default: all) */
+    refresh: (which?: ScreenId[]) => void;
+    /** low-rate (~2 Hz) live values for glareshield / pedestal readouts (FCU windows, ISIS, clock, etc.) */
+    panel: (t: Telemetry) => void;
+  };
   update: (s: VisualState, dt: number) => void;
 }
 
@@ -136,7 +145,8 @@ export function buildCockpit(): CockpitRig {
     group, update,
     screens: {
       pfd: S_PFD.c, nd: S_ND.c, ewd: S_EWD.c, sd: S_SD.c,
-      refresh: () => { S_PFD.t.needsUpdate = true; S_ND.t.needsUpdate = true; S_EWD.t.needsUpdate = true; S_SD.t.needsUpdate = true; },
+      refresh: (which: ScreenId[] = ["pfd", "nd", "ewd", "sd"]) => { const m = { pfd: S_PFD, nd: S_ND, ewd: S_EWD, sd: S_SD }; for (const k of which) m[k].t.needsUpdate = true; },
+      panel: (t: Telemetry) => { void t; },
     },
   };
 }

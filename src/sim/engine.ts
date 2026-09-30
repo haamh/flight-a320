@@ -305,6 +305,8 @@ export class Sim {
       stickX: this.ctl.roll, stickY: this.ctl.pitch, flapLever: this.ctl.flapLever,
       lights: { ...this.lights, landing: this.lights.landing && fm.gearPos > 0.5 || (this.lights.landing && fm.pos.y < 3000) },
       dayFactor: this.world.dayFactor,
+      parkingBrake: this.ctl.parkingBrake, gearLever: this.ctl.gearDown, pedal: this.ctl.yaw,
+      speedbrakeLever: this.ctl.speedbrake, reverseSelected: this.ctl.reverse, onGround: fm.onGround,
     };
   }
   private lastWheel = 0;
@@ -485,7 +487,8 @@ export class Sim {
       drawPFD(s.pfd.getContext("2d")!, s.pfd.width, tel);
       drawND(s.nd.getContext("2d")!, s.nd.width, tel);
       if (this.frame % 6 === 0) { drawEWD(s.ewd.getContext("2d")!, s.ewd.width, tel); drawSD(s.sd.getContext("2d")!, s.sd.width, tel); }
-      s.refresh();
+      s.refresh(this.frame % 6 === 0 ? ["pfd", "nd", "ewd", "sd"] : ["pfd", "nd"]);
+      if (this.frame % 30 === 0) s.panel(tel);
       this.cb.onTelemetry({ ...tel, cam: this.cam, paused: this.paused, lights: this.lights.landing });
     }
     this.vignette.uniforms.time.value = this.simTime;

@@ -4,7 +4,7 @@ import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeom
 import { makeCanvas, glowTexture } from "./textures";
 import { clamp, lerp, smoothstep } from "./noise";
 import { FUS, FL, GEAR_HEIGHT, fuselageSection, surfacePoint, surfaceNormal, thetaAtY, PANES, paneCorners } from "./fuselage";
-import { buildCockpit } from "./cockpit";
+import { buildCockpit, type CockpitRig } from "./cockpit";
 
 export { FUS, GEAR_HEIGHT, fuselageSection, surfacePoint, surfaceNormal };
 
@@ -367,6 +367,13 @@ export interface VisualState {
   flapLever: number; // 0..4
   lights: { nav: boolean; beacon: boolean; strobe: boolean; landing: boolean; taxi: boolean };
   dayFactor: number; // 1 day .. 0 night
+  // flight deck controls
+  parkingBrake: boolean;
+  gearLever: boolean; // true = down
+  pedal: number; // rudder pedal input -1..1 (+ = right)
+  speedbrakeLever: number; // 0..1
+  reverseSelected: boolean;
+  onGround: boolean;
 }
 
 export interface Hinge {
@@ -403,7 +410,7 @@ export interface AircraftRig {
   root: THREE.Group;
   eye: V3;
   update: (s: VisualState, dt: number, time: number) => void;
-  screens: { pfd: HTMLCanvasElement; nd: HTMLCanvasElement; ewd: HTMLCanvasElement; sd: HTMLCanvasElement; refresh: () => void };
+  screens: CockpitRig["screens"];
   wheelContacts: { nose: V3; left: V3; right: V3 };
   hardPoints: { name: string; p: V3 }[];
   lightPositions: { beaconTop: V3 };
