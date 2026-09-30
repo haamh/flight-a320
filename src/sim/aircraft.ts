@@ -962,16 +962,16 @@ export function buildAircraft(): AircraftRig {
     return { bulb, sp, base: size };
   };
   const tipR = wingSec(SPAN).le.clone().add(V(0.05, 0.02, 0.15));
-  const navR = mkLight(tipR, "#33ff66", 2.2);
-  const navL = mkLight(mirV(tipR), "#ff2a2a", 2.2);
+  const navR = mkLight(tipR, "#33ff66", 0.9);
+  const navL = mkLight(mirV(tipR), "#ff2a2a", 0.9);
   const tailS = fuselageSection(FUS.zTail);
-  const navT = mkLight(V(0, tailS.cy + 0.2, FUS.zTail - 0.05), "#ffffff", 1.6);
-  const strR = mkLight(tipR.clone().add(V(0.06, 0.02, 0.3)), "#ffffff", 5);
-  const strL = mkLight(mirV(tipR).add(V(-0.06, 0.02, 0.3)), "#ffffff", 5);
-  const strT = mkLight(V(0, tailS.cy + 0.02, FUS.zTail + 0.28), "#ffffff", 4);
+  const navT = mkLight(V(0, tailS.cy + 0.2, FUS.zTail - 0.05), "#ffffff", 0.8);
+  const strR = mkLight(tipR.clone().add(V(0.06, 0.02, 0.3)), "#ffffff", 2.4);
+  const strL = mkLight(mirV(tipR).add(V(-0.06, 0.02, 0.3)), "#ffffff", 2.4);
+  const strT = mkLight(V(0, tailS.cy + 0.02, FUS.zTail + 0.28), "#ffffff", 2.0);
   const beaconTop = V(0, FUS.R + 0.06, -1.5);
-  const bcnT = mkLight(beaconTop, "#ff2200", 3);
-  const bcnB = mkLight(V(0, -2.34, 1.5), "#ff2200", 3);
+  const bcnT = mkLight(beaconTop, "#ff2200", 1.4);
+  const bcnB = mkLight(V(0, -2.34, 1.5), "#ff2200", 1.4);
   const landingSpots: THREE.SpotLight[] = [];
   const landingBulbs: THREE.Mesh[] = [];
   for (const side of [1, -1]) {

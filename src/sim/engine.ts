@@ -208,7 +208,7 @@ export class Sim {
     this.world.setTime(TIMES[i], this.renderer);
     // bloom is for light sources: the daylit sky sits far above any fixed threshold and would veil the whole frame
     const nf = 1 - this.world.dayFactor;
-    this.bloom.strength = 0.03 + 0.3 * nf; this.bloom.threshold = 8 - 7 * nf;
+    this.bloom.strength = 0.03 + 0.14 * nf; this.bloom.threshold = 8 - 6.5 * nf;
     const night = this.world.dayFactor < 0.5;
     this.lights.landing = night || true;
   }
