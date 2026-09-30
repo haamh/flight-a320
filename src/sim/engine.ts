@@ -5,7 +5,7 @@ import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 import { buildAircraft, type AircraftRig, type VisualState } from "./aircraft";
-import { buildWorld, TIMES, type World } from "./world";
+import { buildWorld, bakeParked, TIMES, type World } from "./world";
 import { FlightModel, FLAP_NAMES, runwayFrame, type Controls } from "./physics";
 import { AIRPORTS, groundAt } from "./terrain";
 import { drawPFD, drawND, drawEWD, drawSD, type Telemetry } from "./instruments";
@@ -25,8 +25,11 @@ export const CAM_MODES: { id: CamMode; name: string }[] = [
 ];
 
 export interface SimMessage { text: string; kind: "info" | "warn" | "good" | "bad"; t: number }
+/** frame statistics: smoothed fps / frame ms, CPU and (when the browser exposes timer queries) GPU ms, render scale (fraction of the pixel-ratio cap), whole-frame draw calls / triangles */
+export interface PerfStats { fps: number; ms: number; cpuMs: number; gpuMs: number; scale: number; calls: number; tris: number }
+export type SimTelemetry = Telemetry & { cam: CamMode; paused: boolean; lights: boolean; perf: PerfStats };
 export interface SimCallbacks {
-  onTelemetry: (t: Telemetry & { cam: CamMode; paused: boolean; lights: boolean }) => void;
+  onTelemetry: (t: SimTelemetry) => void;
   onMessage: (m: SimMessage) => void;
   onEnd: (r: { kind: "crash" | "landed"; title: string; lines: string[] }) => void;
 }
@@ -55,6 +58,9 @@ const VignetteShader = {
     }`,
 };
 
+/** render-scale steps as a fraction of the pixel-ratio cap */
+const SCALE_STEPS = [1, 0.9, 0.8, 0.7, 0.6, 0.5];
+
 export class Sim {
   renderer: THREE.WebGLRenderer;
   camera: THREE.PerspectiveCamera;
@@ -69,8 +75,14 @@ export class Sim {
   running = false;
   lights = { nav: true, beacon: true, strobe: true, landing: true, taxi: true };
   timeIdx = 2;
+  /** live frame statistics (also delivered through onTelemetry) */
+  perf: PerfStats = { fps: 60, ms: 16.7, cpuMs: 0, gpuMs: 0, scale: 1, calls: 0, tris: 0 };
+  /** dynamic resolution: off under browser automation (software GL is always "slow") */
+  dynRes = typeof navigator === "undefined" || !navigator.webdriver;
+  /** true when the reversed float depth buffer is active (otherwise logarithmic depth is the fallback) */
+  readonly reversedDepth: boolean;
   private keys = new Set<string>();
-  private clock = new THREE.Clock();
+  private timer = new THREE.Timer();
   private simTime = 0;
   private frame = 0;
   private orbitYaw = 0.35; private orbitPitch = 0.12; private orbitDist = 48;
@@ -83,7 +95,6 @@ export class Sim {
   private bloom: UnrealBloomPass;
   private vignette: ShaderPass;
   private smoke: { s: THREE.Sprite; v: THREE.Vector3; life: number }[] = [];
-  private smokeMat!: THREE.SpriteMaterial;
   private endShown = false;
   private disposed = false;
   private raf = 0;
@@ -91,47 +102,83 @@ export class Sim {
   private startClock = Date.UTC(2026, 5, 21, 17, 42, 0);
   private lastTrendIas = 0; private trend = 0;
   hudVisible = true;
+  perfVisible = false;
   menuOrbit = true;
   /** dev tooling: body-frame look-at point for the undercarriage camera */
   debugTarget: [number, number, number] | null = null;
   shake = new THREE.Vector3();
+  // scratch objects (no allocations in the frame loop)
+  private sUp = new THREE.Vector3(0, 1, 0);
+  private s1 = new THREE.Vector3(); private s2 = new THREE.Vector3(); private s3 = new THREE.Vector3(); private s4 = new THREE.Vector3();
+  private sq1 = new THREE.Quaternion(); private sEul = new THREE.Euler();
+  private vsLights = { nav: true, beacon: true, strobe: true, landing: true, taxi: true };
+  private vs!: VisualState;
+  private tel!: Telemetry;
+  private destFrame = runwayFrame(AIRPORTS[1], 0);
+  private audioArgs = { n1: 0, ias: 0, gs: 0, onGround: true, gearMoving: false, gearDown: true, inside: false, reverser: 0, spoilers: 0 };
+  private interior: THREE.Object3D[] = [];
+  private interiorOn = true;
+  // frame timing / dynamic resolution
+  private cap: number;
+  private scaleIdx = 0;
+  private lastFrameT = 0;
+  private frameMs = 16.7; private cpuMs = 0; private gpuMs = 0;
+  private drLow = 0; private drHigh = 0; private drCool = 0; private drProbe = 20000; private drProbeT = 0; private drTrial = 0;
+  private lastTelT = 0; private lastPanelT = 0;
+  private gl: WebGL2RenderingContext | null = null;
+  private tq: { ext: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number }; pool: WebGLQuery[]; pending: WebGLQuery[] } | null = null;
 
   constructor(private container: HTMLElement, cb: SimCallbacks) {
     this.cb = cb;
-    const r = new THREE.WebGLRenderer({ antialias: false, logarithmicDepthBuffer: true, powerPreference: "high-performance" });
-    r.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
+    const make = (reversed: boolean) => new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance", ...(reversed ? { reversedDepthBuffer: true } : { logarithmicDepthBuffer: true }) } as THREE.WebGLRendererParameters);
+    let r = make(true);
+    if (!r.capabilities.reversedDepthBuffer) { r.dispose(); r.forceContextLoss(); r = make(false); }
+    this.reversedDepth = r.capabilities.reversedDepthBuffer;
+    this.cap = Math.min(window.devicePixelRatio, 1.75);
+    r.setPixelRatio(this.cap);
     r.setSize(container.clientWidth, container.clientHeight);
     r.toneMapping = THREE.ACESFilmicToneMapping;
     r.toneMappingExposure = 0.55;
     r.outputColorSpace = THREE.SRGBColorSpace;
     r.shadowMap.enabled = true;
     r.shadowMap.type = THREE.PCFShadowMap;
+    r.info.autoReset = false;
     container.appendChild(r.domElement);
     r.domElement.style.display = "block";
     this.renderer = r;
     this.camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.05, 320000);
     const size = r.getDrawingBufferSize(new THREE.Vector2());
-    const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: 4 });
+    // scene target: 4x MSAA half float; with the reversed depth buffer it needs a 32 bit float depth attachment to keep the precision
+    const rt = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, samples: 4, depthTexture: this.reversedDepth ? new THREE.DepthTexture(size.x, size.y, THREE.FloatType) : undefined });
+    rt.resolveDepthBuffer = false;
     this.composer = new EffectComposer(r, rt);
+    this.composer.renderTarget2.resolveDepthBuffer = false;
+    // only the scene (read) buffer needs MSAA; the tone-map / vignette passes write into a plain target
+    const plain = new THREE.WebGLRenderTarget(size.x, size.y, { type: THREE.HalfFloatType, depthBuffer: false });
+    this.composer.renderTarget1.dispose();
+    this.composer.renderTarget1 = plain; this.composer.writeBuffer = plain;
+    this.composer.setSize(container.clientWidth, container.clientHeight);
     this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x / 2, size.y / 2), 0.32, 0.55, 0.95);
     this.vignette = new ShaderPass(VignetteShader);
+    this.timer.connect(document);
+    try {
+      const gl = r.getContext() as WebGL2RenderingContext;
+      const ext = gl.getExtension("EXT_disjoint_timer_query_webgl2");
+      if (ext) { this.gl = gl; this.tq = { ext, pool: [], pending: [] }; }
+    } catch { /* no timer queries */ }
+    this.vs = this.makeVisual();
+    this.tel = this.makeTelemetry();
   }
 
   /** Heavy build step (call after first paint) */
   build() {
     this.rig = buildAircraft();
     const rig = this.rig;
-    const parkedTemplate = rig.root.clone(true);
-    const toRemove: THREE.Object3D[] = [];
-    parkedTemplate.traverse((o) => {
-      if ((o as THREE.Light).isLight || (o as THREE.Sprite).isSprite) toRemove.push(o);
-      const m = o as THREE.Mesh;
-      if (m.isMesh && (m.material as THREE.MeshBasicMaterial).isMeshBasicMaterial && (m.material as THREE.MeshBasicMaterial).toneMapped === false && m.geometry.type !== "PlaneGeometry") toRemove.push(o);
-    });
-    toRemove.forEach((o) => o.parent?.remove(o));
-    this.world = buildWorld(() => parkedTemplate.clone(true));
+    const parked = bakeParked(rig.root);
+    if (import.meta.env.DEV) console.info("[parked aircraft baked]", parked.stats);
+    this.world = buildWorld(parked);
     this.world.scene.add(rig.root);
-    rig.root.traverse((o) => { if ((o as THREE.Mesh).isMesh) { o.castShadow = o.castShadow || false; } });
+    this.interior = rig.root.children.slice(1);
     this.fm.hardPoints = rig.hardPoints;
     // post
     this.composer.addPass(new RenderPass(this.world.scene, this.camera));
@@ -139,12 +186,20 @@ export class Sim {
     this.composer.addPass(new OutputPass());
     this.composer.addPass(this.vignette);
     this.world.setTime(TIMES[this.timeIdx], this.renderer);
-    this.smokeMat = new THREE.SpriteMaterial({ map: softPuffTexture(9), color: "#d8d8d8", transparent: true, depthWrite: false, opacity: 0.6 });
+    const puff = softPuffTexture(9);
+    for (let i = 0; i < 48; i++) {
+      const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: puff, color: "#d8d8d8", transparent: true, depthWrite: false, opacity: 0.6 }));
+      s.visible = false;
+      this.world.scene.add(s);
+      this.smoke.push({ s, v: new THREE.Vector3(), life: 0 });
+    }
     this.bindInput();
     this.resetDeparture();
     this.paused = true;
     this.running = true;
-    this.clock.start();
+    this.world.update(0, 0, this.camera.position, this.fm.pos, this.fm.quat);
+    if (!navigator.webdriver) this.world.warm(this.renderer, this.camera);
+    this.timer.update();
     this.loop();
   }
 
@@ -183,11 +238,13 @@ export class Sim {
   setCam(c: CamMode) {
     this.cam = c;
     this.flybyValid = false;
+    this.lastPanelT = 0;
     if (c === "cockpit" || c === "cabin") { this.headYaw = c === "cabin" ? 1.95 : 0; this.headPitch = c === "cabin" ? -0.22 : -0.1; }
     if (c === "chase") { this.orbitYaw = 0; this.orbitPitch = 0.1; this.orbitDist = 52; }
     if (c === "orbit") { this.orbitYaw = 2.3; this.orbitPitch = 0.15; this.orbitDist = 60; }
     if (c === "gear") { this.orbitYaw = 0.9; this.orbitPitch = -0.1; this.orbitDist = 14; }
   }
+
 
   private bindInput() {
     const el = this.renderer.domElement;
@@ -199,33 +256,34 @@ export class Sim {
       this.keys.add(k);
     };
     const ku = (e: KeyboardEvent) => this.keys.delete(e.key.toLowerCase());
+    const onBlur = () => this.keys.clear();
+    const onDown = (e: MouseEvent) => { this.dragging = true; this.lastMouse = [e.clientX, e.clientY]; };
+    const onUp = () => (this.dragging = false);
     window.addEventListener("keydown", kd);
     window.addEventListener("keyup", ku);
-    window.addEventListener("blur", () => this.keys.clear());
-    el.addEventListener("mousedown", (e) => { this.dragging = true; this.lastMouse = [e.clientX, e.clientY]; });
-    window.addEventListener("mouseup", () => (this.dragging = false));
-    window.addEventListener("mousemove", (e) => {
+    window.addEventListener("blur", onBlur);
+    el.addEventListener("mousedown", onDown);
+    window.addEventListener("mouseup", onUp);
+    const onMove = (e: MouseEvent) => {
       if (!this.dragging) return;
       const dx = e.clientX - this.lastMouse[0], dy = e.clientY - this.lastMouse[1];
       this.lastMouse = [e.clientX, e.clientY];
       if (this.cam === "cockpit" || this.cam === "cabin") {
         this.headYaw -= dx * 0.004; this.headPitch = clamp(this.headPitch - dy * 0.004, -1.2, 1.2);
       } else { this.orbitYaw -= dx * 0.006; this.orbitPitch = clamp(this.orbitPitch + dy * 0.004, -1.3, 1.4); }
-    });
+    };
+    window.addEventListener("mousemove", onMove);
     el.addEventListener("wheel", (e) => {
       e.preventDefault();
       if (this.cam === "cockpit" || this.cam === "cabin" || this.cam === "tower" || this.cam === "flyby") this.zoom = clamp(this.zoom * (e.deltaY > 0 ? 1.08 : 0.92), 0.25, 1.6);
       else this.orbitDist = clamp(this.orbitDist * (e.deltaY > 0 ? 1.1 : 0.9), 8, 900);
     }, { passive: false });
-    const onResize = () => {
-      const w = this.container.clientWidth, h = this.container.clientHeight;
-      this.renderer.setSize(w, h);
-      this.composer.setSize(w, h);
-      this.camera.aspect = w / h; this.camera.updateProjectionMatrix();
-    };
+    const onResize = () => this.applySize();
     window.addEventListener("resize", onResize);
     this.cleanup = () => {
       window.removeEventListener("keydown", kd); window.removeEventListener("keyup", ku); window.removeEventListener("resize", onResize);
+      window.removeEventListener("blur", onBlur); window.removeEventListener("mouseup", onUp); window.removeEventListener("mousemove", onMove);
+      el.removeEventListener("mousedown", onDown);
     };
   }
   private zoom = 1;
@@ -259,6 +317,7 @@ export class Sim {
       case "u": fm.athr = !fm.athr; fm.apSpd = Math.round(fm.ias / KT) * KT; this.msg(fm.athr ? `A/THR ON - SPD ${Math.round(fm.ias / KT)} kt` : "A/THR OFF", fm.athr ? "good" : "warn"); break;
       case "c": { const i = CAM_MODES.findIndex((m) => m.id === this.cam); this.setCam(CAM_MODES[(i + 1) % CAM_MODES.length].id); break; }
       case "h": this.hudVisible = !this.hudVisible; break;
+      case "i": this.perfVisible = !this.perfVisible; break;
       case "m": this.audio.enabled = !this.audio.enabled; this.msg(this.audio.enabled ? "Sound ON" : "Sound OFF", "info"); break;
       case "n": this.setTimeOfDay((this.timeIdx + 1) % TIMES.length); this.msg("Time: " + TIMES[this.timeIdx].name, "info"); break;
       default:
@@ -294,81 +353,103 @@ export class Sim {
     if (c.parkingBrake && c.throttle > 0.3 && this.fm.onGround && this.fm.gs < 1 && this.frame % 120 === 0) this.msg("Parking brake is SET - press P", "warn");
   }
 
-  private visual(): VisualState {
+
+  private makeVisual(): VisualState {
     const fm = this.fm;
     return {
-      gear: fm.gearPos, flapDeg: fm.flapDeg, slat: fm.slat,
-      aileron: fm.surf.aileron, elevator: fm.surf.elevator, rudder: fm.surf.rudder,
-      spoilers: fm.spoilers, groundSpoilers: fm.groundSpoilers, n1: fm.n1, reverser: fm.reverser,
-      wheelSpeed: fm.onGround ? fm.gs : fm.gearPos > 0.5 ? Math.max(0, this.lastWheel * 0.985) : 0,
-      noseSteer: fm.noseSteer, comp: fm.comp, throttle: this.ctl.throttle,
-      stickX: this.ctl.roll, stickY: this.ctl.pitch, flapLever: this.ctl.flapLever,
-      lights: { ...this.lights, landing: this.lights.landing && fm.gearPos > 0.5 || (this.lights.landing && fm.pos.y < 3000) },
-      dayFactor: this.world.dayFactor,
-      parkingBrake: this.ctl.parkingBrake, gearLever: this.ctl.gearDown, pedal: this.ctl.yaw,
-      speedbrakeLever: this.ctl.speedbrake, reverseSelected: this.ctl.reverse, onGround: fm.onGround,
+      gear: 0, flapDeg: 0, slat: 0, aileron: 0, elevator: 0, rudder: 0, spoilers: 0, groundSpoilers: 0, n1: 0, reverser: 0,
+      wheelSpeed: 0, noseSteer: 0, comp: fm.comp, throttle: 0, stickX: 0, stickY: 0, flapLever: 0,
+      lights: this.vsLights, dayFactor: 1, parkingBrake: false, gearLever: true, pedal: 0, speedbrakeLever: 0, reverseSelected: false, onGround: true,
     };
+  }
+  private visual(): VisualState {
+    const fm = this.fm, v = this.vs, c = this.ctl, L = this.lights;
+    v.gear = fm.gearPos; v.flapDeg = fm.flapDeg; v.slat = fm.slat;
+    v.aileron = fm.surf.aileron; v.elevator = fm.surf.elevator; v.rudder = fm.surf.rudder;
+    v.spoilers = fm.spoilers; v.groundSpoilers = fm.groundSpoilers; v.n1 = fm.n1; v.reverser = fm.reverser;
+    v.wheelSpeed = fm.onGround ? fm.gs : fm.gearPos > 0.5 ? Math.max(0, this.lastWheel * 0.985) : 0;
+    v.noseSteer = fm.noseSteer; v.comp = fm.comp; v.throttle = c.throttle;
+    v.stickX = c.roll; v.stickY = c.pitch; v.flapLever = c.flapLever;
+    const vl = this.vsLights;
+    vl.nav = L.nav; vl.beacon = L.beacon; vl.strobe = L.strobe; vl.taxi = L.taxi;
+    vl.landing = L.landing && fm.gearPos > 0.5 || (L.landing && fm.pos.y < 3000);
+    v.dayFactor = this.world.dayFactor;
+    v.parkingBrake = c.parkingBrake; v.gearLever = c.gearDown; v.pedal = c.yaw;
+    v.speedbrakeLever = c.speedbrake; v.reverseSelected = c.reverse; v.onGround = fm.onGround;
+    return v;
   }
   private lastWheel = 0;
 
-  private telemetry(): Telemetry {
-    const fm = this.fm;
-    const dest = AIRPORTS[1];
-    const nav = fm.navTo(dest);
-    const fr = runwayFrame(dest, 0);
-    const dx = fr.thr.x - fm.pos.x, dz = fr.thr.z - fm.pos.z;
-    const brg = ((Math.atan2(dx, -dz) / D2R) + 360) % 360;
-    const ilsValid = nav.along < 0 && nav.along > -35000 && Math.abs(nav.locDevDeg) < 10;
+  private makeTelemetry(): Telemetry {
+    const fm = this.fm, fr = this.destFrame;
     return {
-      ias: fm.ias / KT, gs: fm.gs / KT, alt: (fm.pos.y - 3.45) * 3.28084, vs: fm.vs * 196.85, hdg: fm.heading,
-      pitch: fm.pitch / D2R, bank: fm.bank / D2R, alpha: fm.alpha / D2R, n1: fm.n1, throttle: this.ctl.throttle,
-      flapIdx: this.ctl.flapLever, flapName: FLAP_NAMES[this.ctl.flapLever], flapDeg: fm.flapDeg, slat: fm.slat,
-      gear: fm.gearPos, gearDown: this.ctl.gearDown, ap: fm.ap, athr: fm.athr, apAlt: fm.apAlt * 3.28084, apHdg: fm.apHdg, apSpd: fm.apSpd / KT,
-      gsDev: nav.gsDevDeg, locDev: nav.locDevDeg, ilsValid, distNm: Math.hypot(dx, dz) / 1852, destBrg: brg, destName: dest.icao,
-      mach: fm.mach, gload: fm.gload, spoilers: Math.max(fm.spoilers, fm.groundSpoilers), brake: Math.max(this.ctl.brake, this.ctl.parkingBrake ? 1 : 0),
-      parking: this.ctl.parkingBrake, stall: fm.stall && !fm.onGround, tailstrike: fm.tailstrike, onGround: fm.onGround, agl: fm.agl,
-      reverser: fm.reverser, trend: this.trend, time: this.startClock + this.simTime * 1000,
+      ias: 0, gs: 0, alt: 0, vs: 0, hdg: 0, pitch: 0, bank: 0, alpha: 0, n1: 0, throttle: 0,
+      flapIdx: 0, flapName: "", flapDeg: 0, slat: 0, gear: 0, gearDown: true, ap: "OFF", athr: false, apAlt: 0, apHdg: 0, apSpd: 0,
+      gsDev: 0, locDev: 0, ilsValid: false, distNm: 0, destBrg: 0, destName: AIRPORTS[1].icao,
+      mach: 0, gload: 1, spoilers: 0, brake: 0, parking: true, stall: false, tailstrike: false, onGround: true, agl: 0, reverser: 0, trend: 0, time: 0,
       route: [{ x: 1600, z: 0 }, { x: 11000, z: 0 }, { x: 22000, z: 3200 }, { x: fr.thr.x - 11000, z: fr.thr.z }, { x: fr.thr.x, z: fr.thr.z }],
       pos: { x: fm.pos.x, z: fm.pos.z },
     };
+  }
+  /** fills the shared telemetry record in place (route and pos objects are reused) */
+  private telemetry(): Telemetry {
+    const fm = this.fm, t = this.tel, c = this.ctl;
+    const dest = AIRPORTS[1];
+    const nav = fm.navTo(dest);
+    const fr = this.destFrame;
+    const dx = fr.thr.x - fm.pos.x, dz = fr.thr.z - fm.pos.z;
+    t.ias = fm.ias / KT; t.gs = fm.gs / KT; t.alt = (fm.pos.y - 3.45) * 3.28084; t.vs = fm.vs * 196.85; t.hdg = fm.heading;
+    t.pitch = fm.pitch / D2R; t.bank = fm.bank / D2R; t.alpha = fm.alpha / D2R; t.n1 = fm.n1; t.throttle = c.throttle;
+    t.flapIdx = c.flapLever; t.flapName = FLAP_NAMES[c.flapLever]; t.flapDeg = fm.flapDeg; t.slat = fm.slat;
+    t.gear = fm.gearPos; t.gearDown = c.gearDown; t.ap = fm.ap; t.athr = fm.athr; t.apAlt = fm.apAlt * 3.28084; t.apHdg = fm.apHdg; t.apSpd = fm.apSpd / KT;
+    t.gsDev = nav.gsDevDeg; t.locDev = nav.locDevDeg;
+    t.ilsValid = nav.along < 0 && nav.along > -35000 && Math.abs(nav.locDevDeg) < 10;
+    t.distNm = Math.hypot(dx, dz) / 1852; t.destBrg = ((Math.atan2(dx, -dz) / D2R) + 360) % 360; t.destName = dest.icao;
+    t.mach = fm.mach; t.gload = fm.gload; t.spoilers = Math.max(fm.spoilers, fm.groundSpoilers); t.brake = Math.max(c.brake, c.parkingBrake ? 1 : 0);
+    t.parking = c.parkingBrake; t.stall = fm.stall && !fm.onGround; t.tailstrike = fm.tailstrike; t.onGround = fm.onGround; t.agl = fm.agl;
+    t.reverser = fm.reverser; t.trend = this.trend; t.time = this.startClock + this.simTime * 1000;
+    t.pos.x = fm.pos.x; t.pos.z = fm.pos.z;
+    return t;
   }
 
   private updateCamera(dt: number) {
     const fm = this.fm, cam = this.camera;
     const acPos = fm.pos;
     const q = fm.quat;
+    const up = this.sUp, s1 = this.s1, s2 = this.s2, s3 = this.s3, s4 = this.s4, sq = this.sq1, eu = this.sEul;
     let fov = 55;
     // shake
     const rough = fm.onGround ? clamp(fm.gs / 60, 0, 1) * 0.6 : clamp((fm.ias - 60) / 200, 0, 1) * 0.15 + (fm.gearPos > 0.5 ? 0.05 : 0);
     const t = this.simTime;
     this.shake.set(Math.sin(t * 37.1) + Math.sin(t * 23.7) * 0.6, Math.sin(t * 41.3) * 0.8 + Math.sin(t * 17.9), Math.sin(t * 29.3)).multiplyScalar(rough * 0.012);
     this.camSmoothQ.slerp(q, Math.min(1, dt * 3));
-    const up = new THREE.Vector3(0, 1, 0);
     if (this.cam === "cockpit" || this.cam === "cabin") {
-      const eye = this.cam === "cockpit" ? this.rig.eye.clone() : new THREE.Vector3(-2.2, 1.55, 5.2);
-      const gOff = new THREE.Vector3(0, -(fm.gload - 1) * 0.025, 0);
-      eye.add(gOff).add(this.shake);
+      const eye = s1;
+      if (this.cam === "cockpit") eye.copy(this.rig.eye); else eye.set(-2.2, 1.55, 5.2);
+      eye.y -= (fm.gload - 1) * 0.025;
+      eye.add(this.shake);
       cam.position.copy(eye.applyQuaternion(q).add(acPos));
-      const hq = new THREE.Quaternion().setFromEuler(new THREE.Euler(this.headPitch, this.headYaw, 0, "YXZ"));
-      cam.quaternion.copy(q).multiply(hq);
+      sq.setFromEuler(eu.set(this.headPitch, this.headYaw, 0, "YXZ"));
+      cam.quaternion.copy(q).multiply(sq);
       fov = (this.cam === "cockpit" ? 62 : 58) * this.zoom;
       cam.near = 0.03;
     } else if (this.cam === "chase" || this.cam === "orbit" || this.cam === "gear") {
-      let base: THREE.Quaternion;
       if (this.cam === "chase") {
-        const hdg = Math.atan2(-new THREE.Vector3(0, 0, -1).applyQuaternion(this.camSmoothQ).x, -new THREE.Vector3(0, 0, -1).applyQuaternion(this.camSmoothQ).z);
-        base = new THREE.Quaternion().setFromAxisAngle(up, hdg);
-      } else if (this.cam === "gear") base = q.clone();
-      else base = new THREE.Quaternion();
-      const off = new THREE.Vector3(0, 0, this.orbitDist).applyEuler(new THREE.Euler(-this.orbitPitch, this.orbitYaw, 0, "YXZ")).applyQuaternion(base);
-      const local = this.cam === "gear" ? (this.debugTarget ? new THREE.Vector3(...this.debugTarget) : new THREE.Vector3(0, -2.2, -4)) : new THREE.Vector3(0, 1.2, 0);
-      const target = acPos.clone().add(local.applyQuaternion(this.cam === "gear" ? q : new THREE.Quaternion()));
-      const want = target.clone().add(off);
+        const f = s1.set(0, 0, -1).applyQuaternion(this.camSmoothQ);
+        sq.setFromAxisAngle(up, Math.atan2(-f.x, -f.z));
+      } else if (this.cam === "gear") sq.copy(q);
+      else sq.identity();
+      const off = s2.set(0, 0, this.orbitDist).applyEuler(eu.set(-this.orbitPitch, this.orbitYaw, 0, "YXZ")).applyQuaternion(sq);
+      const local = s3;
+      if (this.cam === "gear") { if (this.debugTarget) local.set(this.debugTarget[0], this.debugTarget[1], this.debugTarget[2]); else local.set(0, -2.2, -4); local.applyQuaternion(q); }
+      else local.set(0, 1.2, 0);
+      const target = s4.copy(acPos).add(local);
+      const want = s1.copy(target).add(off);
       const gh = groundAt(want.x, want.z) + 1.2;
       if (want.y < gh) want.y = gh;
-      cam.position.copy(want).add(this.shake.clone().multiplyScalar(4));
+      cam.position.copy(want).addScaledVector(this.shake, 4);
       cam.up.set(0, 1, 0);
-      if (this.cam === "gear") cam.up.copy(up.clone().applyQuaternion(q));
+      if (this.cam === "gear") cam.up.applyQuaternion(q);
       cam.lookAt(target);
       fov = 50;
       cam.near = 0.1;
@@ -376,7 +457,7 @@ export class Sim {
       let best = AIRPORTS[0], bd = 1e12;
       for (const a of AIRPORTS) { const d = Math.hypot(a.x - acPos.x, a.z - acPos.z); if (d < bd) { bd = d; best = a; } }
       const big = best === AIRPORTS[0];
-      const tpos = new THREE.Vector3(best.x + (big ? 620 : 430), (big ? 52 : 32) + 6, best.z - 431);
+      const tpos = s1.set(best.x + (big ? 620 : 430), (big ? 52 : 32) + 6, best.z - 431);
       cam.position.copy(tpos);
       cam.up.set(0, 1, 0);
       cam.lookAt(acPos);
@@ -384,16 +465,16 @@ export class Sim {
       fov = clamp(2 * Math.atan(60 / dist) / D2R, 1.2, 60) * this.zoom;
       cam.near = 0.5;
     } else if (this.cam === "flyby") {
-      const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
-      const rel = this.flybyPos.clone().sub(acPos);
+      const fwd = s1.set(0, 0, -1).applyQuaternion(q);
+      const rel = s2.copy(this.flybyPos).sub(acPos);
       if (!this.flybyValid || rel.dot(fwd) < -250 || rel.length() > 2000) {
         const sp = Math.max(fm.gs, 20);
-        this.flybyPos.copy(acPos).addScaledVector(fwd, sp * 5).add(new THREE.Vector3(fwd.z, 0, -fwd.x).multiplyScalar(45 + Math.random() * 40));
+        this.flybyPos.copy(acPos).addScaledVector(fwd, sp * 5).add(s3.set(fwd.z, 0, -fwd.x).multiplyScalar(45 + Math.random() * 40));
         const g = groundAt(this.flybyPos.x, this.flybyPos.z) + 1.7;
         this.flybyPos.y = fm.onGround ? g : Math.max(g, acPos.y + (Math.random() - 0.4) * 30);
         this.flybyValid = true;
       }
-      cam.position.copy(this.flybyPos).add(this.shake.clone().multiplyScalar(2)).add(new THREE.Vector3(Math.sin(t * 1.3) * 0.05, Math.sin(t * 1.7) * 0.04, 0));
+      cam.position.copy(this.flybyPos).addScaledVector(this.shake, 2).add(s3.set(Math.sin(t * 1.3) * 0.05, Math.sin(t * 1.7) * 0.04, 0));
       cam.up.set(0, 1, 0);
       cam.lookAt(acPos);
       const dist = this.flybyPos.distanceTo(acPos);
@@ -402,25 +483,104 @@ export class Sim {
     }
     if (Math.abs(cam.fov - fov) > 0.01) { cam.fov = lerp(cam.fov, fov, Math.min(1, dt * 6)); }
     cam.updateProjectionMatrix();
-    // hide interior shell when outside? keep - it's occluded.
     this.vignette.uniforms.amount.value = this.cam === "cockpit" || this.cam === "cabin" ? 0.7 : 1;
   }
 
   private spawnSmoke(p: THREE.Vector3, n: number, strength: number) {
     for (let i = 0; i < n; i++) {
-      const s = new THREE.Sprite(this.smokeMat.clone());
-      s.position.copy(p).add(new THREE.Vector3((Math.random() - 0.5) * 1.2, 0.3, (Math.random() - 0.5) * 1.2));
+      const e = this.smoke.find((x) => x.life <= 0);
+      if (!e) return;
+      const s = e.s;
+      s.position.copy(p); s.position.x += (Math.random() - 0.5) * 1.2; s.position.y += 0.3; s.position.z += (Math.random() - 0.5) * 1.2;
       s.scale.setScalar(1.5);
-      this.world.scene.add(s);
-      const v = this.fm.vel.clone().multiplyScalar(0.25 + Math.random() * 0.2).add(new THREE.Vector3((Math.random() - 0.5) * 3, 1 + Math.random() * 1.5, (Math.random() - 0.5) * 3));
-      this.smoke.push({ s, v, life: 2.5 * strength + Math.random() });
+      s.visible = true;
+      e.v.copy(this.fm.vel).multiplyScalar(0.25 + Math.random() * 0.2);
+      e.v.x += (Math.random() - 0.5) * 3; e.v.y += 1 + Math.random() * 1.5; e.v.z += (Math.random() - 0.5) * 3;
+      e.life = 2.5 * strength + Math.random();
+    }
+  }
+
+  /** frame interval EMA + dynamic resolution (steps down past ~17.5 ms, back up with hysteresis and back-off) */
+  private pace(now: number) {
+    const dtMs = now - this.lastFrameT; this.lastFrameT = now;
+    if (dtMs <= 0 || dtMs > 250) return;
+    if (this.drCool > 0) { this.drCool -= dtMs; return; }
+    this.frameMs += (dtMs - this.frameMs) * 0.04;
+    const P = this.perf;
+    P.ms = this.frameMs; P.fps = 1000 / this.frameMs; P.cpuMs = this.cpuMs; P.gpuMs = this.gpuMs;
+    if (!this.dynRes) return;
+    const gpu = this.gpuMs, cur = SCALE_STEPS[this.scaleIdx];
+    // a step down only helps when the GPU is (or may be) the limit
+    if (this.frameMs > 17.5 && (gpu <= 0 || gpu > 11)) this.drLow += dtMs; else this.drLow = Math.max(0, this.drLow - dtMs * 2);
+    if (this.drLow > 700 && this.scaleIdx < SCALE_STEPS.length - 1) {
+      this.drLow = 0; this.drHigh = 0; this.drProbeT = 0;
+      // a failed step up: stay down longer next time
+      if (this.drTrial > 0) { this.drProbe = Math.min(this.drProbe * 2, 240000); this.drTrial = 0; }
+      this.setScale(this.scaleIdx + 1);
+      return;
+    }
+    if (this.scaleIdx > 0) {
+      const nxt = SCALE_STEPS[this.scaleIdx - 1], k = (nxt / cur) * (nxt / cur);
+      // headroom: GPU timer prediction, or a frame interval well below 60 fps pacing (high refresh displays)
+      const headroom = gpu > 0 ? gpu * k < 13 && this.frameMs < 17.3 : this.frameMs < 12.5 / k;
+      if (headroom) this.drHigh += dtMs; else this.drHigh = 0;
+      this.drProbeT += dtMs;
+      if (this.drTrial > 0) { this.drTrial -= dtMs; if (this.drTrial <= 0) { this.drTrial = 0; this.drProbe = 20000; } }
+      if (this.drHigh > 2000 || (gpu <= 0 && this.drProbeT > this.drProbe && this.frameMs < 17.2)) {
+        if (this.drHigh <= 2000) this.drTrial = 6000;
+        this.drHigh = 0; this.drProbeT = 0;
+        this.setScale(this.scaleIdx - 1);
+      }
+    }
+  }
+  private setScale(i: number) {
+    this.scaleIdx = i;
+    this.drCool = 1500;
+    this.applySize();
+  }
+  private applySize() {
+    const w = this.container.clientWidth, h = this.container.clientHeight;
+    const pr = this.cap * SCALE_STEPS[this.scaleIdx];
+    this.renderer.setPixelRatio(pr);
+    this.renderer.setSize(w, h);
+    this.composer.setPixelRatio(pr);
+    this.composer.setSize(w, h);
+    this.camera.aspect = w / h; this.camera.updateProjectionMatrix();
+    this.perf.scale = SCALE_STEPS[this.scaleIdx];
+  }
+
+  /** GPU time of the scene + post chain via timer queries (async: results arrive a few frames later) */
+  private gpuBegin(): WebGLQuery | null {
+    const tq = this.tq, gl = this.gl;
+    if (!tq || !gl) return null;
+    const q = tq.pool.pop() ?? gl.createQuery();
+    gl.beginQuery(tq.ext.TIME_ELAPSED_EXT, q);
+    return q;
+  }
+  private gpuEnd(q: WebGLQuery | null) {
+    const tq = this.tq, gl = this.gl;
+    if (!tq || !gl || !q) return;
+    gl.endQuery(tq.ext.TIME_ELAPSED_EXT);
+    tq.pending.push(q);
+    if (tq.pending.length > 6) { const o = tq.pending.shift()!; tq.pool.push(o); }
+    const disjoint = gl.getParameter(tq.ext.GPU_DISJOINT_EXT);
+    while (tq.pending.length > 1 && gl.getQueryParameter(tq.pending[0], gl.QUERY_RESULT_AVAILABLE)) {
+      const o = tq.pending.shift()!;
+      if (!disjoint) {
+        const ms = (gl.getQueryParameter(o, gl.QUERY_RESULT) as number) / 1e6;
+        if (ms > 0 && ms < 500) this.gpuMs = this.gpuMs > 0 ? this.gpuMs + (ms - this.gpuMs) * 0.1 : ms;
+      }
+      tq.pool.push(o);
     }
   }
 
   private loop = () => {
     if (this.disposed) return;
     this.raf = requestAnimationFrame(this.loop);
-    const dt = Math.min(this.clock.getDelta(), 0.05);
+    const t0 = performance.now();
+    this.pace(t0);
+    this.timer.update();
+    const dt = Math.min(this.timer.getDelta(), 0.05);
     this.frame++;
     const fm = this.fm;
     if (!this.paused && !fm.crashed) {
@@ -435,7 +595,7 @@ export class Sim {
         const strength = clamp(Math.abs(td.fpm) / 300, 0.3, 3);
         this.audio.thump(strength);
         const q = fm.quat;
-        for (const cp of [fm.contacts.left, fm.contacts.right]) this.spawnSmoke(cp.clone().applyQuaternion(q).add(fm.pos), 6, strength);
+        for (const cp of [fm.contacts.left, fm.contacts.right]) this.spawnSmoke(this.s1.copy(cp).applyQuaternion(q).add(fm.pos), 6, strength);
         const rating = Math.abs(td.fpm) < 120 ? "BUTTER" : Math.abs(td.fpm) < 240 ? "Smooth" : Math.abs(td.fpm) < 450 ? "Firm" : Math.abs(td.fpm) < 800 ? "Hard" : "Very hard";
         this.msg(`Touchdown ${Math.round(td.fpm)} fpm - ${rating}${td.airport ? `, ${Math.round(td.distFromThr)} m past threshold, ${Math.abs(td.offCenter).toFixed(1)} m off centerline` : ""}`, Math.abs(td.fpm) < 450 ? "good" : "warn");
         this.lastTouchdown = td;
@@ -451,7 +611,7 @@ export class Sim {
     if (fm.crashed && !this.endShown) {
       this.endShown = true;
       this.paused = true;
-      this.spawnSmoke(fm.pos.clone(), 30, 3);
+      this.spawnSmoke(fm.pos, 30, 3);
       this.cb.onEnd({ kind: "crash", title: "CRASH", lines: [fm.crashReason, `Speed ${Math.round(fm.gs / KT)} kt · V/S ${Math.round(fm.vs * 196.85)} fpm`] });
     }
     if (!fm.crashed && !this.endShown && fm.landed && fm.onGround && fm.gs < 3 && this.lastTouchdown?.airport?.icao === AIRPORTS[1].icao) {
@@ -467,32 +627,55 @@ export class Sim {
     this.rig.update(this.visual(), this.paused ? 0 : dt, this.simTime + this.frame * 0.0001);
     if (this.menuOrbit) this.orbitYaw += dt * 0.06;
     this.updateCamera(dt);
-    this.world.update(this.simTime, dt, this.camera.position, fm.pos);
+    // interior is only ever seen through the windows from nearby: hide it from distant exterior cameras
+    const inside = this.cam === "cockpit" || this.cam === "cabin";
+    const showInterior = inside || this.camera.position.distanceToSquared(fm.pos) < 45 * 45;
+    if (showInterior !== this.interiorOn) { this.interiorOn = showInterior; for (const o of this.interior) o.visible = showInterior; }
+    this.world.setShadowMode(this.cam === "cockpit" ? "deck" : this.cam === "cabin" ? "cabin" : "exterior");
+    this.world.update(this.simTime, dt, this.camera.position, fm.pos, fm.quat);
     // smoke
-    for (let i = this.smoke.length - 1; i >= 0; i--) {
+    for (let i = 0; i < this.smoke.length; i++) {
       const p = this.smoke[i];
+      if (p.life <= 0) continue;
       p.life -= dt;
       p.v.multiplyScalar(1 - dt * 1.2);
       p.s.position.addScaledVector(p.v, dt);
       p.s.scale.multiplyScalar(1 + dt * 1.6);
-      (p.s.material as THREE.SpriteMaterial).opacity = Math.max(0, Math.min(0.6, p.life * 0.3));
-      if (p.life <= 0) { this.world.scene.remove(p.s); (p.s.material as THREE.Material).dispose(); this.smoke.splice(i, 1); }
+      p.s.material.opacity = Math.max(0, Math.min(0.6, p.life * 0.3));
+      if (p.life <= 0) p.s.visible = false;
     }
     // audio
-    this.audio.update({ n1: fm.n1, ias: fm.ias / KT, gs: fm.gs, onGround: fm.onGround, gearMoving: this.gearMoving > 0, gearDown: fm.gearPos > 0.5, inside: this.cam === "cockpit", reverser: fm.reverser, spoilers: Math.max(fm.spoilers, fm.groundSpoilers) });
-    // instruments
-    if (this.frame % 3 === 0) {
+    const au = this.audioArgs;
+    au.n1 = fm.n1; au.ias = fm.ias / KT; au.gs = fm.gs; au.onGround = fm.onGround; au.gearMoving = this.gearMoving > 0; au.gearDown = fm.gearPos > 0.5;
+    au.inside = this.cam === "cockpit"; au.reverser = fm.reverser; au.spoilers = Math.max(fm.spoilers, fm.groundSpoilers);
+    this.audio.update(au);
+    // instruments: canvases are only redrawn where they can be seen (flight deck in the cockpit camera, HUD mini displays otherwise)
+    const f = this.frame, cockpit = this.cam === "cockpit", mini = this.hudVisible && !cockpit;
+    const dPFD = cockpit ? f % 2 === 0 : mini && f % 3 === 0;
+    const dND = cockpit ? f % 4 === 1 : mini && f % 6 === 2;
+    const dEWD = cockpit && f % 8 === 3, dSD = cockpit && f % 8 === 7;
+    const panelDue = cockpit && t0 - this.lastPanelT > 500;
+    const cbDue = t0 - this.lastTelT > 95;
+    if (dPFD || dND || dEWD || dSD || panelDue || cbDue) {
       const tel = this.telemetry();
       const s = this.rig.screens;
-      drawPFD(s.pfd.getContext("2d")!, s.pfd.width, tel);
-      drawND(s.nd.getContext("2d")!, s.nd.width, tel);
-      if (this.frame % 6 === 0) { drawEWD(s.ewd.getContext("2d")!, s.ewd.width, tel); drawSD(s.sd.getContext("2d")!, s.sd.width, tel); }
-      s.refresh(this.frame % 6 === 0 ? ["pfd", "nd", "ewd", "sd"] : ["pfd", "nd"]);
-      if (this.frame % 30 === 0) s.panel(tel);
-      this.cb.onTelemetry({ ...tel, cam: this.cam, paused: this.paused, lights: this.lights.landing });
+      if (dPFD) { drawPFD(s.pfd.getContext("2d")!, s.pfd.width, tel); s.refresh(["pfd"]); }
+      if (dND) { drawND(s.nd.getContext("2d")!, s.nd.width, tel); s.refresh(["nd"]); }
+      if (dEWD) { drawEWD(s.ewd.getContext("2d")!, s.ewd.width, tel); s.refresh(["ewd"]); }
+      if (dSD) { drawSD(s.sd.getContext("2d")!, s.sd.width, tel); s.refresh(["sd"]); }
+      if (panelDue) { this.lastPanelT = t0; s.panel(tel); }
+      if (cbDue) { this.lastTelT = t0; this.cb.onTelemetry({ ...tel, cam: this.cam, paused: this.paused, lights: this.lights.landing, perf: { ...this.perf } }); }
     }
     this.vignette.uniforms.time.value = this.simTime;
+    // whole-frame renderer statistics (the composer issues several render calls per frame)
+    const info = this.renderer.info;
+    info.autoReset = false; info.reset();
+    const q = this.gpuBegin();
     this.composer.render();
+    this.gpuEnd(q);
+    const P = this.perf;
+    P.calls = info.render.calls; P.tris = info.render.triangles;
+    this.cpuMs += (performance.now() - t0 - this.cpuMs) * 0.05;
   };
   private gearMoving = 0;
   private lastTouchdown: { fpm: number; airport: { icao: string } | null; distFromThr: number; offCenter: number } | null = null;
@@ -509,6 +692,7 @@ export class Sim {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
     this.cleanup();
+    this.timer.dispose();
     this.renderer.dispose();
     this.renderer.domElement.remove();
   }

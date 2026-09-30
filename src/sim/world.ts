@@ -26,47 +26,55 @@ export interface World {
   sunDir: THREE.Vector3;
   dayFactor: number;
   setTime: (t: TimeOfDay, renderer: THREE.WebGLRenderer) => void;
-  update: (time: number, dt: number, camPos: THREE.Vector3, acPos: THREE.Vector3) => void;
+  update: (time: number, dt: number, camPos: THREE.Vector3, acPos: THREE.Vector3, acQuat: THREE.Quaternion) => void;
   lensflareAnchor: THREE.Object3D;
+  /** sun shadow box: tight around the flight deck / wing view, or around the whole aircraft */
+  setShadowMode: (m: ShadowMode) => void;
+  /** compile every shader variant up front (LOD meshes that are not visible yet would otherwise compile mid-flight) */
+  warm: (renderer: THREE.WebGLRenderer, camera: THREE.Camera) => void;
 }
 
 /* ---------------------------------------------------------------------- */
+/* Terrain: world-aligned tiles, per-tile LOD (full res near, coarser with distance),
+   super tiles for the far field and skirts that hide LOD cracks. heightAt()/groundAt()
+   keep sampling TERRAIN.heights untouched. */
+const TB = 30;                 // cells per base tile (122 m cells -> 3.7 km tiles)
+const SBK = 3;                 // base tiles per super tile side
+const BASE_STEPS = [1, 2, 3];  // cells per quad edge for base LOD 0..2
+const SUPER_STEPS = [5, 10];   // same for super tile LOD 0..1
+const BASE_LOD_RANGE = [6000, 11000];
+const SUPER_ON = 20000;        // nearest distance beyond which super tiles replace base tiles
+const SUPER_LOD_RANGE = 45000;
+
+interface TerrainChunk {
+  mesh: THREE.Mesh; lods: THREE.BufferGeometry[]; lod: number;
+  cx: number; cz: number; hw: number; hmin: number; hmax: number; under: boolean;
+}
+interface TerrainSuper extends TerrainChunk { far: boolean; kids: TerrainChunk[] }
+
 function buildTerrainMesh() {
   buildTerrain();
   const { N, size, cx, cz, heights } = TERRAIN;
-  const r = N + 1;
-  const pos = new Float32Array(r * r * 3);
-  const uv = new Float32Array(r * r * 2);
-  const col = new Float32Array(r * r * 3);
+  const r = N + 1, cell = size / N, x0 = cx - size / 2, z0 = cz - size / 2;
+  // per-vertex normal / material weights from the full-resolution grid (shared by every LOD so shading stays consistent)
+  const nrm = new Int16Array(r * r * 4), col = new Uint8Array(r * r * 4);
   for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) {
     const k = j * r + i;
-    const x = cx - size / 2 + (i / N) * size;
-    const z = cz - size / 2 + (j / N) * size;
+    const x = x0 + i * cell, z = z0 + j * cell;
     const h = heights[k];
-    pos[k * 3] = x; pos[k * 3 + 1] = h; pos[k * 3 + 2] = z;
-    uv[k * 2] = i / N; uv[k * 2 + 1] = 1 - j / N;
-    const hx = heights[j * r + Math.min(N, i + 1)] - heights[j * r + Math.max(0, i - 1)];
-    const hz = heights[Math.min(N, j + 1) * r + i] - heights[Math.max(0, j - 1) * r + i];
-    const slope = Math.hypot(hx, hz) / (2 * size / N);
+    const i0 = Math.max(0, i - 1), i1 = Math.min(N, i + 1), j0 = Math.max(0, j - 1), j1 = Math.min(N, j + 1);
+    const hx = heights[j * r + i1] - heights[j * r + i0];
+    const hz = heights[j1 * r + i] - heights[j0 * r + i];
+    const slope = Math.hypot(hx, hz) / (2 * cell);
+    const gx = -hx / ((i1 - i0) * cell), gz = -hz / ((j1 - j0) * cell);
+    const il = 32767 / Math.sqrt(gx * gx + 1 + gz * gz);
+    nrm[k * 4] = gx * il; nrm[k * 4 + 1] = il; nrm[k * 4 + 2] = gz * il;
     const n = fbm(x / 1200, z / 1200, 3);
     const rock = clamp(smoothstep(0.35, 0.7, slope + n * 0.1) + smoothstep(700, 1200, h + n * 200), 0, 1);
     const snow = smoothstep(1350, 1700, h + n * 250) * (1 - smoothstep(0.9, 1.3, slope));
     const sand = smoothstep(4, -1, h) * (1 - rock);
-    col[k * 3] = rock; col[k * 3 + 1] = snow; col[k * 3 + 2] = sand;
+    col[k * 4] = Math.round(rock * 255); col[k * 4 + 1] = Math.round(snow * 255); col[k * 4 + 2] = Math.round(sand * 255); col[k * 4 + 3] = 255;
   }
-  const idx = new Uint32Array(N * N * 6);
-  let p = 0;
-  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
-    const a = j * r + i, b = (j + 1) * r + i, c = (j + 1) * r + i + 1, d = j * r + i + 1;
-    idx[p++] = a; idx[p++] = b; idx[p++] = d;
-    idx[p++] = b; idx[p++] = c; idx[p++] = d;
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
-  g.setAttribute("color", new THREE.BufferAttribute(col, 3));
-  g.setIndex(new THREE.BufferAttribute(idx, 1));
-  g.computeVertexNormals();
   const farm = farmlandTexture();
   farm.repeat.set(size / 3800, size / 3800);
   const detail = grassDetailTexture();
@@ -89,9 +97,146 @@ function buildTerrainMesh() {
       `)
       .replace("#include <color_fragment>", "");
   };
-  const mesh = new THREE.Mesh(g, mat);
-  mesh.receiveShadow = true;
-  return mesh;
+
+  // index buffers are shared by every tile with the same grid size (top grid + 4 skirts, outward facing)
+  const idxCache = new Map<number, THREE.BufferAttribute>();
+  const gridIndex = (n: number) => {
+    let ia = idxCache.get(n);
+    if (ia) return ia;
+    const w = n + 1, nv = w * w, sN = nv, sS = nv + w, sW = nv + 2 * w, sE = nv + 3 * w;
+    const idx: number[] = [];
+    for (let b = 0; b < n; b++) for (let a = 0; a < n; a++) {
+      const A = b * w + a, B = (b + 1) * w + a, C = (b + 1) * w + a + 1, D = b * w + a + 1;
+      idx.push(A, B, D, B, C, D);
+    }
+    for (let a = 0; a < n; a++) {
+      let p0 = a, p1 = a + 1, s0 = sN + a, s1 = s0 + 1;
+      idx.push(p0, p1, s0, p1, s1, s0);
+      p0 = n * w + a; p1 = p0 + 1; s0 = sS + a; s1 = s0 + 1;
+      idx.push(p0, s0, p1, p1, s0, s1);
+    }
+    for (let b = 0; b < n; b++) {
+      let p0 = b * w, p1 = (b + 1) * w, s0 = sW + b, s1 = s0 + 1;
+      idx.push(p0, s0, p1, p1, s0, s1);
+      p0 = b * w + n; p1 = (b + 1) * w + n; s0 = sE + b; s1 = s0 + 1;
+      idx.push(p0, p1, s0, p1, s1, s0);
+    }
+    ia = new THREE.BufferAttribute(new Uint16Array(idx), 1);
+    idxCache.set(n, ia);
+    return ia;
+  };
+
+  // max deviation of a coarse grid (step) from the full-res heights inside a tile (triangle split as in heightAt)
+  const lodError = (i0: number, j0: number, cells: number, step: number) => {
+    let e = 0;
+    for (let cj = 0; cj < cells; cj += step) for (let ci = 0; ci < cells; ci += step) {
+      const I = i0 + ci, J = j0 + cj;
+      const h00 = heights[J * r + I], h10 = heights[J * r + I + step], h01 = heights[(J + step) * r + I], h11 = heights[(J + step) * r + I + step];
+      for (let dj = 0; dj <= step; dj++) for (let di = 0; di <= step; di++) {
+        const tx = di / step, tz = dj / step;
+        const hi = tx + tz <= 1 ? h00 + (h10 - h00) * tx + (h01 - h00) * tz : h11 + (h01 - h11) * (1 - tx) + (h10 - h11) * (1 - tz);
+        const d = Math.abs(heights[(J + dj) * r + I + di] - hi);
+        if (d > e) e = d;
+      }
+    }
+    return e;
+  };
+
+  const makeLod = (i0: number, j0: number, cells: number, step: number, depth: number, ox: number, oz: number, sphere: THREE.Sphere) => {
+    const n = cells / step, w = n + 1, nv = w * w, tot = nv + 4 * w;
+    const pos = new Float32Array(tot * 3), uv = new Float32Array(tot * 2), nr = new Int16Array(tot * 4), cl = new Uint8Array(tot * 4);
+    for (let b = 0; b <= n; b++) for (let a = 0; a <= n; a++) {
+      const gi = i0 + a * step, gj = j0 + b * step, k = gj * r + gi, v = b * w + a;
+      pos[v * 3] = x0 + gi * cell - ox; pos[v * 3 + 1] = heights[k]; pos[v * 3 + 2] = z0 + gj * cell - oz;
+      uv[v * 2] = gi / N; uv[v * 2 + 1] = 1 - gj / N;
+      nr[v * 4] = nrm[k * 4]; nr[v * 4 + 1] = nrm[k * 4 + 1]; nr[v * 4 + 2] = nrm[k * 4 + 2];
+      cl[v * 4] = col[k * 4]; cl[v * 4 + 1] = col[k * 4 + 1]; cl[v * 4 + 2] = col[k * 4 + 2]; cl[v * 4 + 3] = 255;
+    }
+    const skirt = (s: number, d: number) => {
+      pos[d * 3] = pos[s * 3]; pos[d * 3 + 1] = pos[s * 3 + 1] - depth; pos[d * 3 + 2] = pos[s * 3 + 2];
+      uv[d * 2] = uv[s * 2]; uv[d * 2 + 1] = uv[s * 2 + 1];
+      for (let c = 0; c < 4; c++) { nr[d * 4 + c] = nr[s * 4 + c]; cl[d * 4 + c] = cl[s * 4 + c]; }
+    };
+    for (let a = 0; a <= n; a++) { skirt(a, nv + a); skirt(n * w + a, nv + w + a); }
+    for (let b = 0; b <= n; b++) { skirt(b * w, nv + 2 * w + b); skirt(b * w + n, nv + 3 * w + b); }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    g.setAttribute("normal", new THREE.BufferAttribute(nr, 4, true));
+    g.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+    g.setAttribute("color", new THREE.BufferAttribute(cl, 4, true));
+    g.setIndex(gridIndex(n));
+    g.boundingSphere = sphere;
+    return g;
+  };
+
+  const group = new THREE.Group();
+  const nBase = N / TB, nSup = nBase / SBK, SC = TB * SBK;
+  const errs: number[] = new Array(nBase * nBase);
+  const bounds = (i0: number, j0: number, cells: number) => {
+    let lo = Infinity, hi = -Infinity;
+    for (let j = j0; j <= j0 + cells; j++) for (let i = i0; i <= i0 + cells; i++) { const h = heights[j * r + i]; if (h < lo) lo = h; if (h > hi) hi = h; }
+    return [lo, hi];
+  };
+  const mk = (i0: number, j0: number, cells: number, steps: number[], depth: number, lo: number, hi: number): TerrainChunk => {
+    const hw = cells * cell / 2, ox = x0 + i0 * cell + hw, oz = z0 + j0 * cell + hw;
+    const sphere = new THREE.Sphere(new THREE.Vector3(0, (lo + hi - depth) / 2, 0), Math.hypot(hw, hw, (hi - lo + depth) / 2));
+    const lods = steps.map((s) => makeLod(i0, j0, cells, s, depth, ox, oz, sphere));
+    const mesh = new THREE.Mesh(lods[lods.length - 1], mat);
+    mesh.position.set(ox, 0, oz); mesh.matrixAutoUpdate = false; mesh.updateMatrix();
+    mesh.receiveShadow = true; mesh.visible = false;
+    group.add(mesh);
+    return { mesh, lods, lod: lods.length - 1, cx: ox, cz: oz, hw, hmin: lo, hmax: hi, under: hi < WATER_LEVEL - 0.3 };
+  };
+  const bases: TerrainChunk[] = new Array(nBase * nBase);
+  for (let tj = 0; tj < nBase; tj++) for (let ti = 0; ti < nBase; ti++) {
+    const i0 = ti * TB, j0 = tj * TB;
+    let e = 0;
+    for (const s of [2, 3, 5, 10]) e = Math.max(e, lodError(i0, j0, TB, s));
+    errs[tj * nBase + ti] = 2 + e * 1.25;
+    const [lo, hi] = bounds(i0, j0, TB);
+    bases[tj * nBase + ti] = mk(i0, j0, TB, BASE_STEPS, errs[tj * nBase + ti], lo, hi);
+  }
+  const supers: TerrainSuper[] = [];
+  for (let sj = 0; sj < nSup; sj++) for (let si = 0; si < nSup; si++) {
+    const kids: TerrainChunk[] = []; let depth = 0;
+    for (let b = 0; b < SBK; b++) for (let a = 0; a < SBK; a++) { const q = (sj * SBK + b) * nBase + si * SBK + a; kids.push(bases[q]); depth = Math.max(depth, errs[q]); }
+    const [lo, hi] = bounds(si * SC, sj * SC, SC);
+    supers.push({ ...mk(si * SC, sj * SC, SC, SUPER_STEPS, depth, lo, hi), far: false, kids });
+  }
+
+  const dist = (c: TerrainChunk, p: THREE.Vector3) => {
+    const dx = Math.max(Math.abs(p.x - c.cx) - c.hw, 0), dz = Math.max(Math.abs(p.z - c.cz) - c.hw, 0);
+    const dy = p.y < c.hmin ? c.hmin - p.y : p.y > c.hmax ? p.y - c.hmax : 0;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  };
+  const setLod = (c: TerrainChunk, l: number) => { if (c.lod !== l) { c.lod = l; c.mesh.geometry = c.lods[l]; } };
+  let lx = 1e9, ly = 0, lz = 0;
+  const update = (cam: THREE.Vector3) => {
+    if (Math.abs(cam.x - lx) + Math.abs(cam.y - ly) + Math.abs(cam.z - lz) < 20) return;
+    lx = cam.x; ly = cam.y; lz = cam.z;
+    for (const s of supers) {
+      const d = dist(s, cam);
+      s.far = s.far ? d > SUPER_ON * 0.95 : d > SUPER_ON * 1.05;
+      if (s.far) {
+        setLod(s, s.lod === 1 ? (d > SUPER_LOD_RANGE * 0.96 ? 1 : 0) : (d > SUPER_LOD_RANGE * 1.04 ? 1 : 0));
+        s.mesh.visible = !s.under;
+        for (const k of s.kids) k.mesh.visible = false;
+      } else {
+        s.mesh.visible = false;
+        for (const k of s.kids) {
+          if (k.under) { k.mesh.visible = false; continue; }
+          const dk = dist(k, cam);
+          let l = k.lod;
+          while (l < 2 && dk > BASE_LOD_RANGE[l] * 1.04) l++;
+          while (l > 0 && dk < BASE_LOD_RANGE[l - 1] * 0.96) l--;
+          setLod(k, l);
+          k.mesh.visible = true;
+        }
+      }
+    }
+  };
+  group.matrixAutoUpdate = false;
+  return { mesh: group, update, reset: () => { lx = 1e9; } };
 }
 
 /* ---------------------------------------------------------------------- */
@@ -113,9 +258,37 @@ function tireMarksTexture() {
   return t;
 }
 
-interface AirportRuntime { update: (time: number, acPos: THREE.Vector3, day: number) => void }
+interface AirportRuntime { update: (time: number, acPos: THREE.Vector3, day: number, camPos: THREE.Vector3) => void }
 
-function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record<string, THREE.Material>, makeParked: () => THREE.Object3D, lightPts: { pos: number[]; col: number[] }): AirportRuntime {
+/** Static meshes of one parent merged per material / shadow flags (single-material, opaque, non-instanced only). */
+function mergeStatic(parent: THREE.Object3D) {
+  const groups = new Map<string, THREE.Mesh[]>();
+  for (const o of parent.children) {
+    const m = o as THREE.Mesh;
+    if (!m.isMesh || (m as THREE.InstancedMesh).isInstancedMesh || Array.isArray(m.material) || m.material.transparent || !m.visible) continue;
+    const key = `${m.material.uuid}|${m.renderOrder}|${+m.castShadow}${+m.receiveShadow}`;
+    let l = groups.get(key); if (!l) groups.set(key, l = []);
+    l.push(m);
+  }
+  for (const list of groups.values()) {
+    if (list.length < 2) continue;
+    const geoms = list.map((m) => {
+      m.updateMatrix();
+      const g = m.geometry.clone().applyMatrix4(m.matrix);
+      for (const k of Object.keys(g.attributes)) if (k !== "position" && k !== "normal" && k !== "uv") g.deleteAttribute(k);
+      return g;
+    });
+    const merged = geoms.every((g) => g.index && g.attributes.normal && g.attributes.uv) ? mergeGeometries(geoms) : null;
+    geoms.forEach((g) => g.dispose());
+    if (!merged) continue;
+    const mm = new THREE.Mesh(merged, list[0].material);
+    mm.castShadow = list[0].castShadow; mm.receiveShadow = list[0].receiveShadow; mm.renderOrder = list[0].renderOrder;
+    for (const m of list) parent.remove(m);
+    parent.add(mm);
+  }
+}
+
+function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record<string, THREE.Material>, parked: ParkedPart[], lightPts: { pos: number[]; col: number[] }): AirportRuntime {
   const grp = new THREE.Group();
   grp.position.set(a.x, a.elev, a.z);
   grp.rotation.y = (90 - a.heading) * D2R;
@@ -222,6 +395,7 @@ function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record
   grp.add(new THREE.Mesh(mergeGeometries(fins), mats.metal));
   // jet bridges + parked aircraft
   const rnd = mulberry(a.x + 7);
+  const parkedAt: THREE.Vector3[] = [];
   standXs.forEach((x, i) => {
     const bz = tZ + 30;
     const rot = new THREE.Mesh(new THREE.CylinderGeometry(2.4, 2.4, 4.5, 24), mats.facade);
@@ -233,11 +407,8 @@ function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record
     t2.position.set(x - 16 + 5, 5.0, bz + 14 + len / 2 - 2); t2.rotation.y = 0.5; t2.rotation.x = 0.06; t2.castShadow = true; grp.add(t2);
     const leg = new THREE.Mesh(new THREE.BoxGeometry(1, 3.5, 1), mats.metal); leg.position.set(x - 16 + 10, 1.75, bz + 14 + 14); grp.add(leg);
     if (rnd() > 0.25) {
-      const pk = makeParked();
       const standZ = bz + 32;
-      pk.position.copy(new THREE.Vector3(x, 3.45, standZ + 18.6));
-      pk.rotation.y = 0; // nose north (toward terminal)
-      grp.add(pk);
+      parkedAt.push(new THREE.Vector3(x, 3.45, standZ + 18.6)); // nose north (toward terminal)
       // ground service: tug & belt loader
       const tug = new THREE.Mesh(new THREE.BoxGeometry(2.4, 1.4, 4.2), mats.gse); tug.position.set(x + 1.5, 0.7, standZ + 0.5 + 18.6 - 30); tug.castShadow = true; grp.add(tug);
       const bl = new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.0, 8), mats.gse); bl.position.set(x + 4.5, 0.9, standZ + 18.6 - 8.3); bl.rotation.x = -0.18; bl.castShadow = true; grp.add(bl);
@@ -349,24 +520,46 @@ function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record
   const rabbit = new THREE.Points(rabG, rabM); rabbit.frustumCulled = false; scene.add(rabbit);
   const fr = runwayFrame(a, 0);
   const angles = [3.5, 3.17, 2.83, 2.5];
+  // parked aircraft: one InstancedMesh per baked material part, shared geometry
+  const parkedMeshes: THREE.InstancedMesh[] = [];
+  if (parkedAt.length) {
+    const pm = new THREE.Matrix4();
+    for (const part of parked) {
+      const im = new THREE.InstancedMesh(part.geometry, part.material, parkedAt.length);
+      parkedAt.forEach((p, i) => im.setMatrixAt(i, pm.makeTranslation(p.x, p.y, p.z)));
+      im.castShadow = part.cast; im.receiveShadow = part.receive; im.renderOrder = part.renderOrder;
+      im.instanceMatrix.needsUpdate = true;
+      im.computeBoundingSphere();
+      grp.add(im);
+      parkedMeshes.push(im);
+    }
+  }
+  mergeStatic(grp);
+  const sd = new THREE.Vector3(), sw = new THREE.Vector3();
+  const papiState = [-1, -1, -1, -1];
+  const rabPos = rabG.attributes.position as THREE.BufferAttribute;
   return {
-    update(time, acPos, day) {
+    update(time, acPos, day, camPos) {
+      const near = Math.hypot(camPos.x - a.x, camPos.z - a.z) < 14000;
+      for (const m of parkedMeshes) m.visible = near;
       const col = papiG.attributes.color as THREE.BufferAttribute;
-      papiPos.forEach((p, k) => {
-        const d = acPos.clone().sub(p);
-        const horiz = Math.max(1, -d.dot(fr.fwd));
-        const ang = Math.atan2(d.y - 1.5, horiz) / D2R;
-        if (ang > angles[k]) col.setXYZ(k, 1, 0.95, 0.9); else col.setXYZ(k, 1, 0.1, 0.05);
-      });
-      col.needsUpdate = true;
+      let dirty = false;
+      for (let k = 0; k < papiPos.length; k++) {
+        sd.copy(acPos).sub(papiPos[k]);
+        const horiz = Math.max(1, -sd.dot(fr.fwd));
+        const ang = Math.atan2(sd.y - 1.5, horiz) / D2R;
+        const st = ang > angles[k] ? 1 : 0;
+        if (st !== papiState[k]) { papiState[k] = st; dirty = true; if (st) col.setXYZ(k, 1, 0.95, 0.9); else col.setXYZ(k, 1, 0.1, 0.05); }
+      }
+      if (dirty) col.needsUpdate = true;
       papiM.opacity = 0.55 + (1 - day) * 0.45;
       const cycle = (time * 2) % 1;
       const idx = Math.floor(cycle * 24);
       const d = 900 - idx * 25;
       if (d >= 300) {
-        const w = toWorld(-L / 2 - d, 2.2, 0);
-        (rabG.attributes.position as THREE.BufferAttribute).setXYZ(0, w.x, w.y, w.z);
-        rabG.attributes.position.needsUpdate = true;
+        sw.set(-L / 2 - d, 2.2, 0).applyMatrix4(grp.matrixWorld);
+        rabPos.setXYZ(0, sw.x, sw.y, sw.z);
+        rabPos.needsUpdate = true;
         rabbit.visible = true;
       } else rabbit.visible = false;
       rabM.opacity = 0.6 + (1 - day) * 0.4;
@@ -375,8 +568,9 @@ function buildAirport(scene: THREE.Scene, a: Airport, big: boolean, mats: Record
 }
 
 /* ---------------------------------------------------------------------- */
-function treeGeometry() {
-  const crown = new THREE.IcosahedronGeometry(1, 2);
+/** Tree crown: deformed icosahedron (detail 0/1) or octahedron, vertex colour = white. */
+function crownGeometry(kind: "ico1" | "ico0" | "octa") {
+  const crown = kind === "octa" ? new THREE.OctahedronGeometry(1, 0) : new THREE.IcosahedronGeometry(1, kind === "ico1" ? 1 : 0);
   const pos = crown.attributes.position as THREE.BufferAttribute;
   const rnd = mulberry(3);
   for (let i = 0; i < pos.count; i++) {
@@ -386,14 +580,20 @@ function treeGeometry() {
   }
   crown.translate(0, 2.3, 0);
   crown.computeVertexNormals();
-  const trunk = new THREE.CylinderGeometry(0.12, 0.18, 1.6, 6); trunk.translate(0, 0.8, 0);
-  const cc = new Float32Array(crown.attributes.position.count * 3).fill(1);
-  crown.setAttribute("color", new THREE.BufferAttribute(cc, 3));
+  crown.deleteAttribute("uv");
+  crown.setAttribute("color", new THREE.BufferAttribute(new Float32Array(pos.count * 3).fill(1), 3));
+  return crown;
+}
+
+/** Near tree: 80-face crown + open 5-sided trunk. */
+function treeGeometry() {
+  const crown = crownGeometry("ico1");
+  const trunk = new THREE.CylinderGeometry(0.12, 0.18, 1.6, 5, 1, true); trunk.translate(0, 0.8, 0);
   const tc = new Float32Array(trunk.attributes.position.count * 3);
   for (let i = 0; i < tc.length; i += 3) { tc[i] = 0.45; tc[i + 1] = 0.35; tc[i + 2] = 0.3; }
   trunk.setAttribute("color", new THREE.BufferAttribute(tc, 3));
-  trunk.deleteAttribute("uv"); crown.deleteAttribute("uv");
-  return mergeGeometries([crown.toNonIndexed(), trunk.toNonIndexed()]);
+  trunk.deleteAttribute("uv");
+  return mergeGeometries([crown, trunk.toNonIndexed()])!;
 }
 
 function nearAirport(x: number, z: number, margin: number) {
@@ -402,7 +602,138 @@ function nearAirport(x: number, z: number, margin: number) {
 }
 
 /* ---------------------------------------------------------------------- */
-export function buildWorld(makeParked: () => THREE.Object3D): World {
+/** Spatial bins of instance matrices / colours -> one InstancedMesh (per LOD) per cell so frustum culling works. */
+class InstanceBins {
+  cells = new Map<number, { m: number[]; c: number[] }>();
+  constructor(private cell: number) {}
+  add(m: THREE.Matrix4, c: THREE.Color) {
+    const e = m.elements;
+    const key = (Math.floor(e[12] / this.cell) + 512) * 4096 + Math.floor(e[14] / this.cell) + 512;
+    let b = this.cells.get(key); if (!b) this.cells.set(key, b = { m: [], c: [] });
+    for (let i = 0; i < 16; i++) b.m.push(e[i]);
+    b.c.push(c.r, c.g, c.b);
+  }
+}
+interface LodChunk { cx: number; cy: number; cz: number; r: number; meshes: THREE.InstancedMesh[] }
+
+function buildChunks(bins: InstanceBins, geoms: THREE.BufferGeometry[], mat: THREE.Material, flags: { cast: boolean; recv: boolean }[], parent: THREE.Object3D): LodChunk[] {
+  const out: LodChunk[] = [];
+  for (const b of bins.cells.values()) {
+    const n = b.c.length / 3;
+    const im = new THREE.InstancedBufferAttribute(new Float32Array(b.m), 16);
+    const ic = new THREE.InstancedBufferAttribute(new Float32Array(b.c), 3);
+    const meshes = geoms.map((g, k) => {
+      const mesh = new THREE.InstancedMesh(g, mat, n);
+      mesh.instanceMatrix = im; mesh.instanceColor = ic;
+      mesh.castShadow = flags[k].cast; mesh.receiveShadow = flags[k].recv; mesh.visible = false;
+      mesh.matrixAutoUpdate = false;
+      parent.add(mesh);
+      return mesh;
+    });
+    meshes[0].computeBoundingSphere();
+    const s = meshes[0].boundingSphere!;
+    for (const m of meshes) m.boundingSphere = s;
+    out.push({ cx: s.center.x, cy: s.center.y, cz: s.center.z, r: s.radius, meshes });
+  }
+  return out;
+}
+
+function updateChunks(chunks: LodChunk[], cam: THREE.Vector3, ranges: number[], maxD: number) {
+  for (const ch of chunks) {
+    const dx = cam.x - ch.cx, dy = cam.y - ch.cy, dz = cam.z - ch.cz;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - ch.r;
+    let l = -1;
+    if (d < maxD) { l = ranges.length; for (let i = 0; i < ranges.length; i++) if (d < ranges[i]) { l = i; break; } }
+    for (let k = 0; k < ch.meshes.length; k++) ch.meshes[k].visible = k === l;
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+export interface ParkedPart { geometry: THREE.BufferGeometry; material: THREE.Material; cast: boolean; receive: boolean; renderOrder: number }
+export interface ParkedTemplate { parts: ParkedPart[]; stats: { meshes: number; interiorMeshes: number; dropped: number; parts: number; triangles: number } }
+
+/** Bake the exterior of an aircraft root into merged geometry grouped by material. Only the first child of
+ *  the root (exterior group) is used; interior (back-faced lining, anything else), lights, sprites and
+ *  emissive bulbs are left out. */
+export function bakeParked(root: THREE.Object3D): ParkedTemplate {
+  const tpl = root.clone(true);
+  tpl.position.set(0, 0, 0); tpl.quaternion.identity(); tpl.scale.set(1, 1, 1);
+  tpl.updateMatrixWorld(true);
+  const stats = { meshes: 0, interiorMeshes: 0, dropped: 0, parts: 0, triangles: 0 };
+  tpl.children.forEach((c, i) => { if (i > 0) c.traverse((o) => { if ((o as THREE.Mesh).isMesh) stats.interiorMeshes++; }); });
+  const ext = tpl.children[0];
+  const buckets = new Map<string, { mat: THREE.Material; cast: boolean; recv: boolean; ro: number; geoms: THREE.BufferGeometry[] }>();
+  const isBulb = (mt: THREE.Material, g: THREE.BufferGeometry) => (mt as THREE.MeshBasicMaterial).isMeshBasicMaterial && mt.toneMapped === false && g.type !== "PlaneGeometry";
+  const tmp = new THREE.Matrix4();
+  const bake = (m: THREE.Mesh, mw: THREE.Matrix4) => {
+    const mats = Array.isArray(m.material) ? m.material : [m.material];
+    const src = m.geometry;
+    const g = src.clone();
+    for (const k of Object.keys(g.attributes)) if (k !== "position" && k !== "normal" && k !== "uv" && k !== "uv1" && k !== "color") g.deleteAttribute(k);
+    g.morphAttributes = {};
+    if (!g.attributes.normal) g.computeVertexNormals();
+    const cnt = g.attributes.position.count;
+    if (!g.attributes.uv) g.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(cnt * 2), 2));
+    if (!g.index) g.setIndex(Array.from({ length: cnt }, (_, i) => i));
+    g.applyMatrix4(mw);
+    if (mw.determinant() < 0) { const ix = g.index!.array as Uint16Array | Uint32Array; for (let i = 0; i < ix.length; i += 3) { const t = ix[i + 1]; ix[i + 1] = ix[i + 2]; ix[i + 2] = t; } }
+    const ranges = src.groups.length && Array.isArray(m.material) ? src.groups.map((gr) => ({ s: gr.start, c: gr.count, mi: gr.materialIndex ?? 0 })) : [{ s: 0, c: g.index!.count, mi: 0 }];
+    for (const r of ranges) {
+      const mt = mats[r.mi];
+      if (!mt || isBulb(mt, src) || mt.side === THREE.BackSide) { stats.dropped++; continue; }
+      const sub = ranges.length === 1 ? g : new THREE.BufferGeometry();
+      if (sub !== g) {
+        for (const k of Object.keys(g.attributes)) sub.setAttribute(k, g.attributes[k]);
+        sub.setIndex(Array.from((g.index!.array as Uint32Array).subarray(r.s, r.s + r.c)));
+      }
+      const key = `${mt.uuid}|${m.renderOrder}|${+m.castShadow}${+m.receiveShadow}`;
+      let b = buckets.get(key); if (!b) buckets.set(key, b = { mat: mt, cast: m.castShadow, recv: m.receiveShadow, ro: m.renderOrder, geoms: [] });
+      b.geoms.push(sub);
+    }
+  };
+  ext.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (!m.isMesh || (m as THREE.SkinnedMesh).isSkinnedMesh) return;
+    for (let p: THREE.Object3D | null = o; p; p = p.parent) if (!p.visible) { stats.dropped++; return; }
+    stats.meshes++;
+    if ((m as THREE.InstancedMesh).isInstancedMesh) {
+      const im = m as THREE.InstancedMesh;
+      for (let i = 0; i < im.count; i++) { im.getMatrixAt(i, tmp); bake(m, tmp.premultiply(m.matrixWorld)); }
+    } else bake(m, m.matrixWorld);
+  });
+  const parts: ParkedPart[] = [];
+  for (const b of buckets.values()) {
+    const cnt = b.mat.vertexColors;
+    const opt = b.geoms.some((g) => g.attributes.uv1);
+    for (const g of b.geoms) {
+      const n = g.attributes.position.count;
+      if (opt && !g.attributes.uv1) g.setAttribute("uv1", new THREE.BufferAttribute(new Float32Array(n * 2), 2));
+      if (cnt) {
+        const c = g.attributes.color;
+        if (!c) g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(n * 3).fill(1), 3));
+        else if (c.itemSize !== 3) { const a = new Float32Array(n * 3); for (let i = 0; i < n; i++) { a[i * 3] = c.getX(i); a[i * 3 + 1] = c.getY(i); a[i * 3 + 2] = c.getZ(i); } g.setAttribute("color", new THREE.BufferAttribute(a, 3)); }
+      } else g.deleteAttribute("color");
+    }
+    const merged = mergeGeometries(b.geoms, false);
+    if (!merged) { stats.dropped += b.geoms.length; continue; }
+    merged.computeBoundingSphere();
+    stats.triangles += merged.index!.count / 3;
+    parts.push({ geometry: merged, material: b.mat, cast: b.cast, receive: b.recv, renderOrder: b.ro });
+  }
+  stats.parts = parts.length;
+  return { parts, stats };
+}
+
+/* ---------------------------------------------------------------------- */
+export type ShadowMode = "deck" | "cabin" | "exterior";
+const SHADOW_MODES: Record<ShadowMode, { half: number; near: number; far: number; bias: number; normalBias: number; off: [number, number, number] }> = {
+  deck: { half: 10, near: 200, far: 1000, bias: -0.00004, normalBias: 0.015, off: [0, 0.8, -14.2] },
+  cabin: { half: 26, near: 10, far: 1200, bias: -0.0002, normalBias: 0.03, off: [0, 0, 1] },
+  exterior: { half: 60, near: 10, far: 1200, bias: -0.0003, normalBias: 0.06, off: [0, 0, 0] },
+};
+
+/* ---------------------------------------------------------------------- */
+export function buildWorld(parked: ParkedTemplate): World {
   const scene = new THREE.Scene();
   const sky = new Sky();
   sky.scale.setScalar(250000);
@@ -410,15 +741,30 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
   skyU.mieCoefficient.value = 0.004;
   skyU.mieDirectionalG.value = 0.82;
   if (skyU.cloudCoverage) { skyU.cloudCoverage.value = 0.35; skyU.cloudDensity.value = 0.35; skyU.cloudScale.value = 0.00012; }
+  // drawn after all opaque geometry: with depth testing on, covered sky pixels are rejected before the (expensive) sky shader runs.
+  // The sky sits at the far plane: depth 1 (standard) or 0 (reversed depth buffer).
+  sky.material.vertexShader = sky.material.vertexShader.replace("gl_Position.z = gl_Position.w; // set z to camera.far",
+    "#ifdef USE_REVERSED_DEPTH_BUFFER\n gl_Position.z = 0.0;\n #else\n gl_Position.z = gl_Position.w;\n #endif");
+  sky.renderOrder = 1000;
   scene.add(sky);
 
   const sun = new THREE.DirectionalLight("#fff4e5", 3.2);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(4096, 4096);
+  sun.shadow.mapSize.set(2048, 2048);
   const sc = sun.shadow.camera as THREE.OrthographicCamera;
-  sc.left = -70; sc.right = 70; sc.top = 70; sc.bottom = -70; sc.near = 10; sc.far = 1200;
-  sun.shadow.bias = -0.0003; sun.shadow.normalBias = 0.04;
   scene.add(sun, sun.target);
+  let shadowMode: ShadowMode | null = null;
+  const shadowOff = new THREE.Vector3();
+  const setShadowMode = (m: ShadowMode) => {
+    if (m === shadowMode) return;
+    shadowMode = m;
+    const c = SHADOW_MODES[m];
+    sc.left = -c.half; sc.right = c.half; sc.top = c.half; sc.bottom = -c.half; sc.near = c.near; sc.far = c.far;
+    sc.updateProjectionMatrix();
+    sun.shadow.bias = c.bias; sun.shadow.normalBias = c.normalBias;
+    shadowOff.set(...c.off);
+  };
+  setShadowMode("exterior");
   const hemi = new THREE.HemisphereLight("#bcd4ff", "#4a4535", 0.6);
   scene.add(hemi);
   const fog = new THREE.FogExp2("#b9c9da", 1 / 42000);
@@ -426,7 +772,7 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
 
   // terrain + water
   const terrain = buildTerrainMesh();
-  scene.add(terrain);
+  scene.add(terrain.mesh);
   const wn = waterNormalTexture();
   wn.repeat.set(1800, 1800);
   const water = new THREE.Mesh(new THREE.PlaneGeometry(TERRAIN.size, TERRAIN.size).rotateX(-Math.PI / 2), new THREE.MeshPhysicalMaterial({ color: "#123447", roughness: 0.06, metalness: 0, normalMap: wn, normalScale: new THREE.Vector2(0.4, 0.4), clearcoat: 0.5, envMapIntensity: 1.2 }));
@@ -466,7 +812,7 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
     glowMap: new THREE.SpriteMaterial({ map: glowMap }),
   };
   const lightPts = { pos: [] as number[], col: [] as number[] };
-  const airports = AIRPORTS.map((a, i) => buildAirport(scene, a, i === 0, mats, makeParked, lightPts));
+  const airports = AIRPORTS.map((a, i) => buildAirport(scene, a, i === 0, mats, parked.parts, lightPts));
   const lg = new THREE.BufferGeometry();
   lg.setAttribute("position", new THREE.Float32BufferAttribute(lightPts.pos, 3));
   lg.setAttribute("color", new THREE.Float32BufferAttribute(lightPts.col, 3));
@@ -475,14 +821,13 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
   lightsObj.frustumCulled = false;
   scene.add(lightsObj);
 
-  // trees
+  // trees: binned into 2.5 km cells, three LODs per cell (80 faces / 20 faces / octahedron), culled beyond ~20 km
   const rnd = mulberry(2024);
-  const treeG = treeGeometry();
   const treeM = new THREE.MeshStandardMaterial({ color: "#ffffff", vertexColors: true, roughness: 0.95 });
   const NT = 14000;
-  const trees = new THREE.InstancedMesh(treeG, treeM, NT);
-  trees.castShadow = true; trees.receiveShadow = true;
+  const treeBins = new InstanceBins(2500);
   const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), sv = new THREE.Vector3(), pv = new THREE.Vector3();
+  const yAxis = new THREE.Vector3(0, 1, 0);
   const colr = new THREE.Color();
   let placed = 0, tries = 0;
   while (placed < NT && tries < NT * 12) {
@@ -497,17 +842,19 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
       if (nearAirport(xx, zz, 100)) continue;
       const s = 5 + rnd() * 7;
       pv.set(xx, heightAt(xx, zz) - 0.3, zz);
-      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), rnd() * 6.28);
+      q.setFromAxisAngle(yAxis, rnd() * 6.28);
       sv.set(s * (0.8 + rnd() * 0.4), s * (0.9 + rnd() * 0.5), s * (0.8 + rnd() * 0.4));
       m4.compose(pv, q, sv);
-      trees.setMatrixAt(placed, m4);
       colr.setHSL(0.24 + rnd() * 0.08, 0.35 + rnd() * 0.25, 0.14 + rnd() * 0.1);
-      trees.setColorAt(placed, colr);
+      treeBins.add(m4, colr);
       placed++;
     }
   }
-  trees.count = placed;
-  scene.add(trees);
+  const treeGroup = new THREE.Group();
+  treeGroup.matrixAutoUpdate = false;
+  const treeChunks = buildChunks(treeBins, [treeGeometry(), crownGeometry("ico0"), crownGeometry("octa")], treeM,
+    [{ cast: true, recv: true }, { cast: true, recv: true }, { cast: false, recv: false }], treeGroup);
+  scene.add(treeGroup);
 
   // city near Bayview + town near Aurora
   const facade = buildingFacadeTexture(3);
@@ -523,8 +870,7 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
   };
   const roofG = new THREE.BoxGeometry(1, 1, 1); roofG.translate(0, 0.5, 0);
   const NB = 2600;
-  const bld = new THREE.InstancedMesh(roofG, bMat, NB);
-  bld.castShadow = true; bld.receiveShadow = true;
+  const bldBins = new InstanceBins(2500);
   let nb = 0;
   const cities = [{ x: 45500, z: 8200, r: 3200, tall: true }, { x: -2500, z: 5200, r: 1500, tall: false }, { x: 20000, z: 4800, r: 900, tall: false }];
   for (const c of cities) {
@@ -539,36 +885,96 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
       const centre = 1 - rr / c.r;
       const hgt = c.tall && centre > 0.75 && rnd() > 0.5 ? 60 + rnd() * 160 : 6 + rnd() * (10 + centre * 30);
       const w = 14 + rnd() * 18, d = 14 + rnd() * 18;
-      m4.compose(pv.set(x, h0 - 0.5, z), q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), 0), sv.set(w, hgt, d));
-      bld.setMatrixAt(nb, m4);
+      m4.compose(pv.set(x, h0 - 0.5, z), q.setFromAxisAngle(yAxis, 0), sv.set(w, hgt, d));
       colr.setHSL(0.08 + rnd() * 0.5, 0.05 + rnd() * 0.1, 0.55 + rnd() * 0.35);
-      bld.setColorAt(nb, colr);
+      bldBins.add(m4, colr);
       nb++;
     }
   }
-  bld.count = nb;
-  scene.add(bld);
+  const bldGroup = new THREE.Group();
+  bldGroup.matrixAutoUpdate = false;
+  const bldChunks = buildChunks(bldBins, [roofG], bMat, [{ cast: true, recv: true }], bldGroup);
+  scene.add(bldGroup);
 
-  // clouds
+  // clouds: one instanced camera-facing octagon per puff, re-sorted back to front at a low rate
   const puff = softPuffTexture(5);
-  const cloudGroup = new THREE.Group();
-  const cloudMats: THREE.SpriteMaterial[] = [];
-  for (let v = 0; v < 3; v++) cloudMats.push(new THREE.SpriteMaterial({ map: puff, color: "#ffffff", transparent: true, depthWrite: false, fog: true, opacity: 0.85 }));
+  const cp: number[] = [], cs: number[] = [], ct: number[] = [];
   for (let c = 0; c < 55; c++) {
     const cx = -15000 + rnd() * 75000, cz = -22000 + rnd() * 44000, cy = 1500 + rnd() * 700;
     if (Math.abs(cz - 1600) < 2500 && cx > -3000 && cx < 44000 && rnd() < 0.6) continue;
     const n = 8 + Math.floor(rnd() * 10);
     const size = 350 + rnd() * 450;
     for (let i = 0; i < n; i++) {
-      const s = new THREE.Sprite(cloudMats[i % 3]);
       const ox = (rnd() - 0.5) * size * 2.2, oz = (rnd() - 0.5) * size * 1.6, oy = rnd() * size * 0.45 * (1 - Math.abs(ox) / (size * 1.2));
-      s.position.set(cx + ox, cy + oy, cz + oz);
+      cp.push(cx + ox, cy + oy, cz + oz);
       const ss = size * (0.7 + rnd() * 0.8) * (1 - Math.abs(ox) / (size * 2.4));
-      s.scale.set(ss, ss * 0.8, 1);
-      cloudGroup.add(s);
+      cs.push(ss, ss * 0.8);
+      ct.push(i % 3);
     }
   }
-  scene.add(cloudGroup);
+  const NC = ct.length;
+  const cloudGeo = new THREE.InstancedBufferGeometry();
+  {
+    const R = 0.5 / Math.cos(Math.PI / 8), p: number[] = [0, 0, 0], u: number[] = [0.5, 0.5], ix: number[] = [];
+    for (let k = 0; k < 8; k++) {
+      const a = Math.PI / 8 + k * Math.PI / 4, x = Math.cos(a) * R, y = Math.sin(a) * R;
+      p.push(x, y, 0); u.push(x + 0.5, y + 0.5);
+      ix.push(0, 1 + k, 1 + (k + 1) % 8);
+    }
+    cloudGeo.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
+    cloudGeo.setAttribute("uv", new THREE.Float32BufferAttribute(u, 2));
+    cloudGeo.setIndex(ix);
+  }
+  const aPos = new THREE.InstancedBufferAttribute(new Float32Array(NC * 3), 3);
+  const aSize = new THREE.InstancedBufferAttribute(new Float32Array(NC * 2), 2);
+  const aTint = new THREE.InstancedBufferAttribute(new Float32Array(NC), 1);
+  aPos.setUsage(THREE.DynamicDrawUsage); aSize.setUsage(THREE.DynamicDrawUsage); aTint.setUsage(THREE.DynamicDrawUsage);
+  cloudGeo.setAttribute("iPos", aPos); cloudGeo.setAttribute("iSize", aSize); cloudGeo.setAttribute("iTint", aTint);
+  cloudGeo.instanceCount = NC;
+  const cloudTints = [new THREE.Color(), new THREE.Color(), new THREE.Color()];
+  const cloudU = THREE.UniformsUtils.clone(THREE.UniformsLib.fog) as Record<string, THREE.IUniform>;
+  cloudU.map = { value: puff }; cloudU.tints = { value: cloudTints }; cloudU.opacity = { value: 0.85 };
+  const cloudMat = new THREE.ShaderMaterial({
+    uniforms: cloudU, transparent: true, depthWrite: false, fog: true,
+    vertexShader: `
+      attribute vec3 iPos; attribute vec2 iSize; attribute float iTint;
+      varying vec2 vUv; varying float vTint;
+      #include <fog_pars_vertex>
+      void main() {
+        vUv = uv; vTint = iTint;
+        vec4 mvPosition = modelViewMatrix * vec4(iPos, 1.0);
+        mvPosition.xy += position.xy * iSize;
+        gl_Position = projectionMatrix * mvPosition;
+        #include <fog_vertex>
+      }`,
+    fragmentShader: `
+      uniform sampler2D map; uniform vec3 tints[3]; uniform float opacity;
+      varying vec2 vUv; varying float vTint;
+      #include <fog_pars_fragment>
+      void main() {
+        vec4 t = texture2D(map, vUv);
+        gl_FragColor = vec4(tints[int(vTint + 0.5)] * t.rgb, t.a * opacity);
+        #include <fog_fragment>
+      }`,
+  });
+  const clouds = new THREE.Mesh(cloudGeo, cloudMat);
+  clouds.frustumCulled = false; clouds.matrixAutoUpdate = false;
+  scene.add(clouds);
+  const cOrder = new Uint16Array(NC), cKey = new Float32Array(NC);
+  for (let i = 0; i < NC; i++) cOrder[i] = i;
+  const cCmp = (a: number, b: number) => cKey[b] - cKey[a];
+  let cloudTimer = 1e9;
+  const sortClouds = (cam: THREE.Vector3) => {
+    for (let i = 0; i < NC; i++) { const dx = cp[i * 3] - cam.x, dy = cp[i * 3 + 1] - cam.y, dz = cp[i * 3 + 2] - cam.z; cKey[i] = dx * dx + dy * dy + dz * dz; }
+    cOrder.sort(cCmp);
+    const pa = aPos.array as Float32Array, sa = aSize.array as Float32Array, ta = aTint.array as Float32Array;
+    for (let k = 0; k < NC; k++) {
+      const i = cOrder[k];
+      pa[k * 3] = cp[i * 3]; pa[k * 3 + 1] = cp[i * 3 + 1]; pa[k * 3 + 2] = cp[i * 3 + 2];
+      sa[k * 2] = cs[i * 2]; sa[k * 2 + 1] = cs[i * 2 + 1]; ta[k] = ct[i];
+    }
+    aPos.needsUpdate = true; aSize.needsUpdate = true; aTint.needsUpdate = true;
+  };
 
   // stars
   const starG = new THREE.BufferGeometry();
@@ -599,8 +1005,18 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
   let envRT: THREE.WebGLRenderTarget | null = null;
 
   const sunDir = new THREE.Vector3();
+  const tgt = new THREE.Vector3();
+  const tmpC = new THREE.Color(), tmpC2 = new THREE.Color();
+  let lodX = 1e9, lodY = 0, lodZ = 0;
   const world: World = {
-    scene, sun, sunDir, dayFactor: 1, lensflareAnchor,
+    scene, sun, sunDir, dayFactor: 1, lensflareAnchor, setShadowMode,
+    warm(renderer, camera) {
+      terrain.mesh.traverse((o) => { o.visible = true; });
+      for (const ch of treeChunks) for (const m of ch.meshes) m.visible = true;
+      for (const ch of bldChunks) for (const m of ch.meshes) m.visible = true;
+      renderer.compile(scene, camera);
+      terrain.reset(); lodX = 1e9;
+    },
     setTime(t, renderer) {
       const phi = (90 - t.elev) * D2R, theta = (180 - t.az) * D2R;
       sunDir.setFromSphericalCoords(1, phi, theta);
@@ -623,11 +1039,9 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
       fog.color.copy(fogC);
       fog.density = 1 / lerp(30000, 45000, warm);
       envGround.material.color.set(new THREE.Color("#0a0b0c").lerp(new THREE.Color("#4b5540"), day));
-      cloudMats.forEach((m, i) => {
-        const base = new THREE.Color("#1a2030").lerp(new THREE.Color(warm > 0.4 ? "#ffffff" : "#ffd9bd"), day);
-        m.color.copy(base).multiplyScalar(0.92 + i * 0.04);
-        m.opacity = 0.55 + day * 0.35;
-      });
+      tmpC2.set("#1a2030").lerp(tmpC.set(warm > 0.4 ? "#ffffff" : "#ffd9bd"), day);
+      for (let i = 0; i < 3; i++) cloudTints[i].copy(tmpC2).multiplyScalar(0.92 + i * 0.04);
+      cloudU.opacity.value = 0.55 + day * 0.35;
       starM.opacity = 1 - smoothstep(-8, -2, t.elev);
       renderer.toneMappingExposure = lerp(0.9, 0.52, day);
       bMat.emissiveIntensity = (1 - day) * 1.6;
@@ -639,17 +1053,25 @@ export function buildWorld(makeParked: () => THREE.Object3D): World {
       scene.environment = envRT.texture;
       scene.environmentIntensity = lerp(0.25, 1, day);
     },
-    update(time, dt, camPos, acPos) {
+    update(time, dt, camPos, acPos, acQuat) {
       sky.position.copy(camPos);
       stars.position.copy(camPos);
-      // shadow follows aircraft
-      sun.target.position.copy(acPos);
-      sun.position.copy(acPos).addScaledVector(sunDir, 600);
+      // shadow box follows the aircraft (flight deck in cockpit mode); the projection only changes with the mode
+      tgt.copy(shadowOff).applyQuaternion(acQuat).add(acPos);
+      sun.target.position.copy(tgt);
+      sun.position.copy(tgt).addScaledVector(sunDir, 600);
       lensflareAnchor.position.copy(camPos).addScaledVector(sunDir, 150000);
       wn.offset.x = time * 0.004; wn.offset.y = time * 0.002;
       if (skyU.time) skyU.time.value = time;
-      airports.forEach((a) => a.update(time, acPos, world.dayFactor));
-      void dt;
+      for (let i = 0; i < airports.length; i++) airports[i].update(time, acPos, world.dayFactor, camPos);
+      if (Math.abs(camPos.x - lodX) + Math.abs(camPos.y - lodY) + Math.abs(camPos.z - lodZ) > 20) {
+        lodX = camPos.x; lodY = camPos.y; lodZ = camPos.z;
+        updateChunks(treeChunks, camPos, [500, 2500], 20000);
+        updateChunks(bldChunks, camPos, [], 65000);
+      }
+      terrain.update(camPos);
+      cloudTimer += dt;
+      if (cloudTimer > 0.25) { cloudTimer = 0; sortClouds(camPos); }
     },
   };
   void tileNoise; void wn2;
