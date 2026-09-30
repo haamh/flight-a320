@@ -45,7 +45,7 @@ export default function App() {
   const [tel, setTel] = useState<Tel | null>(null);
   const [msgs, setMsgs] = useState<SimMessage[]>([]);
   const [end, setEnd] = useState<EndInfo>(null);
-  const [timeIdx, setTimeIdx] = useState(2);
+  const [timeIdx, setTimeIdx] = useState(1);
   const [help, setHelp] = useState(false);
   const [hud, setHud] = useState(true);
   const [perfOn, setPerfOn] = useState(false);

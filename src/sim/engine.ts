@@ -74,7 +74,7 @@ export class Sim {
   paused = true;
   running = false;
   lights = { nav: true, beacon: true, strobe: true, landing: true, taxi: true };
-  timeIdx = 2;
+  timeIdx = 1;
   /** live frame statistics (also delivered through onTelemetry) */
   perf: PerfStats = { fps: 60, ms: 16.7, cpuMs: 0, gpuMs: 0, scale: 1, calls: 0, tris: 0 };
   /** dynamic resolution: off under browser automation (software GL is always "slow") */
@@ -158,7 +158,7 @@ export class Sim {
     this.composer.renderTarget1.dispose();
     this.composer.renderTarget1 = plain; this.composer.writeBuffer = plain;
     this.composer.setSize(container.clientWidth, container.clientHeight);
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x / 2, size.y / 2), 0.32, 0.55, 0.95);
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x / 2, size.y / 2), 0.05, 0.35, 8);
     this.vignette = new ShaderPass(VignetteShader);
     this.timer.connect(document);
     try {
@@ -185,7 +185,7 @@ export class Sim {
     this.composer.addPass(this.bloom);
     this.composer.addPass(new OutputPass());
     this.composer.addPass(this.vignette);
-    this.world.setTime(TIMES[this.timeIdx], this.renderer);
+    this.setTimeOfDay(this.timeIdx);
     const puff = softPuffTexture(9);
     for (let i = 0; i < 48; i++) {
       const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: puff, color: "#d8d8d8", transparent: true, depthWrite: false, opacity: 0.6 }));
@@ -206,6 +206,9 @@ export class Sim {
   setTimeOfDay(i: number) {
     this.timeIdx = i;
     this.world.setTime(TIMES[i], this.renderer);
+    // bloom is for light sources: the daylit sky sits far above any fixed threshold and would veil the whole frame
+    const nf = 1 - this.world.dayFactor;
+    this.bloom.strength = 0.03 + 0.3 * nf; this.bloom.threshold = 8 - 7 * nf;
     const night = this.world.dayFactor < 0.5;
     this.lights.landing = night || true;
   }
