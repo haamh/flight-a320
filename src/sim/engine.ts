@@ -198,6 +198,7 @@ export class Sim {
     }
     this.bindInput();
     this.syncControls();
+    if (import.meta.env.DEV) import("./overlap").then((m) => { (window as unknown as { checkOverlaps?: unknown }).checkOverlaps = (o?: import("./overlap").OverlapOptions) => m.checkOverlaps(this.rig.root, o); });
     this.resetDeparture();
     this.paused = true;
     this.running = true;
