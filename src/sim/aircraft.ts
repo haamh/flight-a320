@@ -3,7 +3,7 @@ import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 import { makeCanvas, glowTexture } from "./textures";
 import { clamp, lerp, smoothstep } from "./noise";
-import { FUS, FL, GEAR_HEIGHT, fuselageSection, surfacePoint, surfaceNormal, skinPoint, thetaAtY, WINDOWS, offsetOutline, windowParamOutline, windowMatrix, windowPoint, type FlightDeckWindow } from "./fuselage";
+import { FUS, FL, GEAR_HEIGHT, fuselageSection, surfacePoint, surfaceNormal, skinPoint, thetaAtY, WINDOWS, offsetOutline, windowParamOutline, windowMatrix, windowPoint, skinHeight, skinHeightRange, type FlightDeckWindow } from "./fuselage";
 import { buildCockpit, type CockpitRig } from "./cockpit";
 
 export { FUS, GEAR_HEIGHT, fuselageSection, surfacePoint, surfaceNormal };
@@ -552,12 +552,44 @@ export function buildAircraft(): AircraftRig {
     g.deleteAttribute("uv");
     return g;
   };
+  /** triangulate an outline given in fuselage (z, theta) space, subdivide it and lay it on the skin at `off`: follows the surface exactly */
+  const skinPatch = (outer: [number, number][], hole: [number, number][] | null, off: number, sub: number) => {
+    const V2 = (a: [number, number][]) => a.map(([z, th]) => new THREE.Vector2(z, th));
+    const o2 = V2(outer), h2 = hole ? V2(hole) : [];
+    const faces = THREE.ShapeUtils.triangulateShape(o2, hole ? [h2] : []);
+    const pts = o2.concat(h2);
+    let tris: THREE.Vector2[][] = faces.map((f) => [pts[f[0]], pts[f[1]], pts[f[2]]]);
+    for (let k = 0; k < sub; k++) {
+      const next: THREE.Vector2[][] = [];
+      for (const [a, b, c] of tris) {
+        const ab = a.clone().add(b).multiplyScalar(0.5), bc = b.clone().add(c).multiplyScalar(0.5), ca = c.clone().add(a).multiplyScalar(0.5);
+        next.push([a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]);
+      }
+      tris = next;
+    }
+    const pos: number[] = [], tmp = V();
+    for (const t of tris) {
+      const p = t.map((q) => skinPoint(q.x, q.y, off, tmp.clone()));
+      const cen = p[0].clone().add(p[1]).add(p[2]).multiplyScalar(1 / 3);
+      const n = p[1].clone().sub(p[0]).cross(p[2].clone().sub(p[0]));
+      const radial = V(cen.x, cen.y - fuselageSection(cen.z).cy, 0);
+      if (n.dot(radial) < 0) p.reverse();
+      for (const q of p) pos.push(q.x, q.y, q.z);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    g.computeVertexNormals();
+    return g;
+  };
   const glassG: THREE.BufferGeometry[] = [], sealG: THREE.BufferGeometry[] = [], frameG: THREE.BufferGeometry[] = [];
+  const wsRange = new Map<FlightDeckWindow, { lo: number; hi: number }>();
   for (const w of WINDOWS) {
-    glassG.push(paneShape(w, w.outline2, null, -0.004));
-    sealG.push(paneShape(w, offsetOutline(w, 0.018), offsetOutline(w, -0.012), 0.0035));
-    // interior window frame (covers the lining cut-out)
-    frameG.push(paneShape(w, offsetOutline(w, 0.05), offsetOutline(w, -0.006), -0.062, 0.045));
+    // glass and seal ring lie on the skin itself (glass a hair below, seal a hair above): flush, no gap anywhere round the frame
+    glassG.push(skinPatch(windowParamOutline(w, 0, 0), null, -0.004, 3));
+    sealG.push(skinPatch(windowParamOutline(w, 0.02, 0), windowParamOutline(w, -0.012, 0), 0.0025, 1));
+    // interior window frame (covers the lining cut-out), kept inside the shell wherever the skin dips below the pane plane
+    const r = skinHeightRange(w, 0.05); wsRange.set(w, r);
+    frameG.push(paneShape(w, offsetOutline(w, 0.05), offsetOutline(w, -0.006), r.lo - 0.075, 0.045));
   }
   // dark flight-deck backing seen through the glass when the interior is culled (distant views, parked aircraft)
   const backG: THREE.BufferGeometry[] = [];
@@ -590,7 +622,10 @@ export function buildAircraft(): AircraftRig {
       const L = a2.distanceTo(b2);
       const m = windowMatrix(w);
       const ang = Math.atan2(dir.y, dir.x);
-      const part = (len: number, wd: number, th: number, along: number, across: number, lift: number) => {
+      const mid = a2.clone().addScaledVector(dir, L * 0.5).addScaledVector(inward, 0.04);
+      const hs = Math.max(skinHeight(w, a2.x, a2.y), skinHeight(w, b2.x, b2.y), skinHeight(w, mid.x, mid.y));
+      const part = (len: number, wd: number, th: number, along: number, across: number, lift0: number) => {
+        const lift = lift0 + hs;
         const g = new THREE.BoxGeometry(len, wd, th);
         g.translate(len / 2, 0, 0);
         g.rotateZ(ang);

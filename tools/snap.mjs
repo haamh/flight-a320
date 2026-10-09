@@ -39,6 +39,9 @@ const P = {
   "nose-side-close": { mode: "departure", cam: "gear", orbit: [Math.PI / 2 + 0.25, 0.08, 6.5], target: "nose" },
   "ref-34": { mode: "departure", cam: "gear", orbit: [-Math.PI + 0.95, 0.06, 34], target: "mid" },
   "nose-far": { mode: "departure", cam: "gear", orbit: [Math.PI - 0.5, 0.05, 60], target: "nose" },
+  "ws-front": { mode: "departure", cam: "gear", orbit: [Math.PI, 0.18, 3.6], target: "ws" },
+  "ws-side": { mode: "departure", cam: "gear", orbit: [Math.PI / 2 + 0.55, 0.12, 3.2], target: "ws" },
+  "ws-macro": { mode: "departure", cam: "gear", orbit: [Math.PI / 2 + 0.35, 0.1, 1.3], target: "wsm" },
   "chase": { mode: "departure", cam: "chase", orbit: [0.4, 0.12, 55] },
 };
 
@@ -76,7 +79,7 @@ for (const name of presets) {
     if (p.head) { sim.headYaw = p.head[0]; sim.headPitch = p.head[1]; }
     if (p.orbit) { sim.orbitYaw = p.orbit[0]; sim.orbitPitch = p.orbit[1]; sim.orbitDist = p.orbit[2]; }
     sim.zoom = p.zoom ?? 1;
-    sim.debugTarget = p.target === "nose" ? [0, 0.6, -15.8] : p.target === "mid" ? [0, -0.5, -3] : null;
+    sim.debugTarget = p.target === "nose" ? [0, 0.6, -15.8] : p.target === "mid" ? [0, -0.5, -3] : p.target === "ws" ? [0.45, 0.95, -16.2] : p.target === "wsm" ? [1.5, 0.65, -15.9] : null;
     // let camera fov lerp settle and gather frame timings
     const info = sim.renderer.info;
     const frame = () => new Promise((r) => requestAnimationFrame(() => r()));

@@ -263,12 +263,14 @@ const _s = V(), _c = V(), _dir = V(), _x = V(), _acc = V(), _n = V();
  * e.g. the cabin lining); facet planes are shifted by the same amount. Points are moved radially within their
  * section so the (z, theta) parametrisation (UVs, texture masks) stays consistent.
  */
+/** the skin stays smooth: glass and seals are built to follow it, so nothing dents or steps around a window */
+const CONFORM_WINDOWS = true;
 export function skinPoint(z: number, th: number, off = 0, out = V()): V3 {
   const s = fuselageSection(z);
   sectionXY(s, th, _s, z);
   if (off !== 0) _s.addScaledVector(rawNormal(z, th, _n), off);
   out.copy(_s);
-  if (z > WZ_MAX || z < WZ_MIN) return out;
+  if (CONFORM_WINDOWS || z > WZ_MAX || z < WZ_MIN) return out;
   let wsum = 0;
   _acc.set(0, 0, 0);
   const thR = wrapTheta(th, 1), thL = wrapTheta(th, -1);
@@ -324,3 +326,18 @@ export function surfacePoint(z: number, th: number, off = 0): V3 {
   return p;
 }
 
+
+/** signed height of the skin above a pane's plane (along its normal) at pane coords (u, v) */
+export function skinHeight(w: FlightDeckWindow, u: number, v: number) {
+  const p = windowPoint(w, u, v);
+  const q = skinPoint(p.z, thetaOfPoint(p));
+  return w.n.dot(q.sub(p));
+}
+/** range of skinHeight over the pane outline grown by `grow` (so interior parts can stay inside the shell) */
+export function skinHeightRange(w: FlightDeckWindow, grow = 0) {
+  let lo = Infinity, hi = -Infinity;
+  for (const p of offsetOutline(w, grow)) { const h = skinHeight(w, p.x, p.y); lo = Math.min(lo, h); hi = Math.max(hi, h); }
+  const c = w.corners2.reduce((a, p) => a.add(p), new THREE.Vector2()).multiplyScalar(0.25);
+  const hc = skinHeight(w, c.x, c.y); lo = Math.min(lo, hc); hi = Math.max(hi, hc);
+  return { lo, hi };
+}
