@@ -342,7 +342,7 @@ function efisPanel(S: Sink, side: -1 | 1) {
 export function glareshield(): Panel {
   const { W, H } = GL;
   const f = mkFace(W, H, GL.ppm); const S = new Sink(f); const { ctx } = S;
-  paintBase(f, COL.char, 7, 5);
+  paintBase(f, "#18191c", 7, 5);
   // anti-glare hood darker at the front
   const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, "rgba(0,0,0,0.30)"); g.addColorStop(0.55, "rgba(0,0,0,0.05)"); g.addColorStop(1, "rgba(255,255,255,0.03)");
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);

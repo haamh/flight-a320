@@ -526,7 +526,7 @@ export function buildCockpit(): CockpitRig {
     // oxygen mask stowage box against the side wall
     const ox = sd * (wallHalf(-15.25, 0.42) - 0.11);
     MT.rbox([ox, 0.42, -15.25], [0.14, 0.2, 0.26], 0.012, "#58626e");
-    MT.box([ox - sd * 0.071, 0.44, -15.25], [0.004, 0.11, 0.2], "#d8d22a");
+    MT.box([ox - sd * 0.071, 0.44, -15.25], [0.004, 0.11, 0.2], "#9a9a3a");
     MT.box([ox - sd * 0.072, 0.365, -15.25], [0.004, 0.03, 0.06], C.red);
     MT.cyl([ox - sd * 0.075, 0.49, -15.25], 0.02, 0.012, "#151719", "x");
     // cup holder ring
@@ -626,6 +626,9 @@ export function buildCockpit(): CockpitRig {
   lever(sbPiv, "spdbrk", "Speed brake lever (click)");
   lever(pbPiv, "park", "Parking brake (click)");
   thrL.forEach((g) => lever(g, "thrust", "Thrust levers (scroll, left/right click for detents)"));
+
+  // the interior is shielded from the sky: keep image-based light low so panels keep their own colour
+  group.traverse((o) => { const m = (o as THREE.Mesh).material as THREE.MeshStandardMaterial | undefined; if (m && (m as THREE.MeshStandardMaterial).isMeshStandardMaterial) m.envMapIntensity = 0.28; });
 
   const cockpitLight = new THREE.PointLight("#ffe7c4", 0.6, 3.6, 1.5);
   cockpitLight.position.set(0, 1.0, -15.4); group.add(cockpitLight);

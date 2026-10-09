@@ -126,7 +126,7 @@ export class Sim {
   private lastFrameT = 0;
   private frameMs = 16.7; private cpuMs = 0; private gpuMs = 0;
   private drLow = 0; private drHigh = 0; private drCool = 0; private drProbe = 20000; private drProbeT = 0; private drTrial = 0;
-  private lastTelT = 0; private lastPanelT = 0;
+  private lastTelT = 0; private lastPanelT = 0; private redrawAll = true;
   private gl: WebGL2RenderingContext | null = null;
   private tq: { ext: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number }; pool: WebGLQuery[]; pending: WebGLQuery[] } | null = null;
 
@@ -207,10 +207,22 @@ export class Sim {
     this.loop();
   }
 
+  /** the flight deck is shielded from the sky: bind the (re-baked) environment to its materials at a low intensity */
+  private dimInteriorReflections() {
+    const env = this.world.scene.environment;
+    for (const o of this.interior) o.traverse((c) => {
+      const m = (c as THREE.Mesh).material as THREE.MeshStandardMaterial | undefined;
+      if (!m || !m.isMeshStandardMaterial) return;
+      if (m.envMap !== env) { m.envMap = env; m.needsUpdate = true; }
+      m.envMapIntensity = 0.4;
+    });
+  }
+
   setTimeOfDay(i: number) {
     this.timeIdx = i;
     this.world.setTime(TIMES[i], this.renderer);
     // bloom is for light sources: the daylit sky sits far above any fixed threshold and would veil the whole frame
+    this.dimInteriorReflections();
     const nf = 1 - this.world.dayFactor;
     this.bloom.strength = 0.03 + 0.14 * nf; this.bloom.threshold = 8 - 6.5 * nf;
     const night = this.world.dayFactor < 0.5;
@@ -245,7 +257,7 @@ export class Sim {
   setCam(c: CamMode) {
     this.cam = c;
     this.flybyValid = false;
-    this.lastPanelT = 0;
+    this.lastPanelT = 0; this.redrawAll = true;
     if (c === "cockpit" || c === "cabin") { this.headYaw = c === "cabin" ? 1.95 : 0; this.headPitch = c === "cabin" ? -0.22 : -0.1; }
     if (c === "chase") { this.orbitYaw = 0; this.orbitPitch = 0.1; this.orbitDist = 52; }
     if (c === "orbit") { this.orbitYaw = 2.3; this.orbitPitch = 0.15; this.orbitDist = 60; }
@@ -750,9 +762,10 @@ export class Sim {
     this.audio.update(au);
     // instruments: canvases are only redrawn where they can be seen (flight deck in the cockpit camera, HUD mini displays otherwise)
     const f = this.frame, cockpit = this.cam === "cockpit", mini = this.hudVisible && !cockpit;
-    const dPFD = cockpit ? f % 2 === 0 : mini && f % 3 === 0;
-    const dND = cockpit ? f % 4 === 1 : mini && f % 6 === 2;
-    const dEWD = cockpit && f % 8 === 3, dSD = cockpit && f % 8 === 7;
+    const all = this.redrawAll && (cockpit || mini); if (all) this.redrawAll = false;
+    const dPFD = all || (cockpit ? f % 2 === 0 : mini && f % 3 === 0);
+    const dND = all || (cockpit ? f % 4 === 1 : mini && f % 6 === 2);
+    const dEWD = cockpit && (all || f % 8 === 3), dSD = cockpit && (all || f % 8 === 7);
     const panelDue = cockpit && t0 - this.lastPanelT > 500;
     const cbDue = t0 - this.lastTelT > 95;
     if (dPFD || dND || dEWD || dSD || panelDue || cbDue) {

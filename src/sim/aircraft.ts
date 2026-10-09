@@ -463,7 +463,7 @@ export function buildAircraft(): AircraftRig {
     dark: new THREE.MeshStandardMaterial({ color: "#1d2024", roughness: 0.6, metalness: 0.3 }),
     glass: flightDeckGlass(),
     seal: new THREE.MeshStandardMaterial({ color: "#121416", roughness: 0.55, metalness: 0.1 }),
-    winFrame: new THREE.MeshStandardMaterial({ color: "#5a626d", roughness: 0.7, metalness: 0.05 }),
+    winFrame: new THREE.MeshStandardMaterial({ color: "#555a60", roughness: 0.8, metalness: 0.04, envMapIntensity: 0.25 }),
     pylon: new THREE.MeshPhysicalMaterial({ color: "#c9ced4", roughness: 0.38, metalness: 0.3, clearcoat: 0.6, side: THREE.DoubleSide }),
   };
 
@@ -995,7 +995,7 @@ export function buildAircraft(): AircraftRig {
 
   /* ---------------- Cockpit interior ---------------- */
   const cockpit = new THREE.Group(); root.add(cockpit);
-  const lining = new THREE.MeshStandardMaterial({ color: "#6f7883", roughness: 0.9, side: THREE.BackSide, alphaMap: liv.liningAlpha, alphaTest: 0.5 });
+  const lining = new THREE.MeshStandardMaterial({ color: "#8a8d90", envMapIntensity: 0.25, roughness: 0.92, side: THREE.BackSide, alphaMap: liv.liningAlpha, alphaTest: 0.5 });
   {
     const zl: number[] = [];
     for (let z = -18.2; z <= -11.9; z += 0.06) zl.push(z);
